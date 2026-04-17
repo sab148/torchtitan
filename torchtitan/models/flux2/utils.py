@@ -38,6 +38,11 @@ def _candidate_hf_hub_caches() -> list[str]:
     if hf_home:
         candidates.append(os.path.join(hf_home, "hub"))
 
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if user:
+        candidates.append(f"/p/scratch/atmlaml/{user}/.cache/hub")
+        candidates.append(f"/p/home/jusers/{user}/juwels/.cache/huggingface/hub")
+
     repo_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..")
     )
@@ -51,6 +56,32 @@ def _candidate_hf_hub_caches() -> list[str]:
             seen.add(norm)
             deduped.append(norm)
     return deduped
+
+
+def _resolve_local_hf_asset_dir(repo_id: str) -> str | None:
+    repo_name = repo_id.split('/')[-1]
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..")
+    )
+    candidate_dirs = [
+        os.path.join(repo_root, "assets", "hf", repo_name),
+        os.path.join(os.path.dirname(repo_root), "assets", "hf", repo_name),
+    ]
+
+    required_weight_files = (
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "pytorch_model.bin",
+        "pytorch_model.bin.index.json",
+    )
+
+    for candidate in candidate_dirs:
+        if not os.path.isfile(os.path.join(candidate, "config.json")):
+            continue
+        if any(os.path.isfile(os.path.join(candidate, filename)) for filename in required_weight_files):
+            return candidate
+
+    return None
 
 
 def _resolve_local_hf_snapshot(repo_id: str, *, repo_type: str = "model") -> str | None:
@@ -89,6 +120,10 @@ def _resolve_text_encoder_model_spec(model_spec: str) -> str:
     if os.path.exists(model_spec):
         return model_spec
 
+    local_asset_dir = _resolve_local_hf_asset_dir(model_spec)
+    if local_asset_dir is not None:
+        return local_asset_dir
+
     local_snapshot = _resolve_local_hf_snapshot(model_spec, repo_type="model")
     if local_snapshot is not None:
         return local_snapshot
@@ -123,6 +158,16 @@ def _resolve_flux2_autoencoder_path(ckpt_path: str) -> str:
         filename=AE_FILENAME,
         repo_type="model",
     )
+
+
+def load_flux2_transformer_state_dict(ckpt_path: str, *, device: str | torch.device = "cpu") -> dict[str, Tensor]:
+    if not ckpt_path:
+        raise ValueError("Transformer checkpoint path is empty")
+    if not os.path.exists(ckpt_path):
+        raise ValueError(
+            f"Transformer checkpoint path {ckpt_path} does not exist. Please update encoder.transformer_path."
+        )
+    return load_sft(ckpt_path, device=str(device))
 
 
 def load_flux2_autoencoder(

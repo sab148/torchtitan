@@ -14,6 +14,9 @@ class Flux2EncoderConfig:
     autoencoder_path: str = ""
     """Optional local path to ``ae.safetensors``. Empty falls back to ``AE_MODEL_PATH`` or HF."""
 
+    transformer_path: str = ""
+    """Optional local path to pretrained FLUX.2 transformer weights in safetensors format."""
+
     text_encoder_model: str = ""
     """Optional local or Hugging Face override for the FLUX.2 text encoder weights."""
 

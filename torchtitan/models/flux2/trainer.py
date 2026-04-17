@@ -10,24 +10,45 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    set_model_state_dict,
+    StateDictOptions,
+)
 
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.trainer import Trainer
 
-from .configs import Flux2EncoderConfig
-from .flux_datasets import Flux2DataLoader
-from .parallelize import parallelize_text_encoder
-from .tokenizer import Flux2TokenizerContainer
-from .utils import (
-    create_image_position_ids,
-    create_text_position_ids,
-    flatten_image_tokens,
-    load_flux2_autoencoder,
-    load_flux2_text_encoder,
-    preprocess_flux2_batch,
-)
+try:
+    from .configs import Flux2EncoderConfig
+    from .flux_datasets import Flux2DataLoader
+    from .parallelize import parallelize_text_encoder
+    from .tokenizer import Flux2TokenizerContainer
+    from .utils import (
+        create_image_position_ids,
+        create_text_position_ids,
+        flatten_image_tokens,
+        load_flux2_autoencoder,
+        load_flux2_text_encoder,
+        load_flux2_transformer_state_dict,
+        preprocess_flux2_batch,
+    )
+except ImportError:
+    from torchtitan.models.flux2.configs import Flux2EncoderConfig
+    from torchtitan.models.flux2.flux_datasets import Flux2DataLoader
+    from torchtitan.models.flux2.parallelize import parallelize_text_encoder
+    from torchtitan.models.flux2.tokenizer import Flux2TokenizerContainer
+    from torchtitan.models.flux2.utils import (
+        create_image_position_ids,
+        create_text_position_ids,
+        flatten_image_tokens,
+        load_flux2_autoencoder,
+        load_flux2_text_encoder,
+        load_flux2_transformer_state_dict,
+        preprocess_flux2_batch,
+    )
 
 
 class Flux2Trainer(Trainer):
@@ -58,6 +79,27 @@ class Flux2Trainer(Trainer):
         config.training.seq_len = seq_len_img + seq_len_txt
 
         super().__init__(config)
+
+        if config.encoder.transformer_path:
+            state_dict = load_flux2_transformer_state_dict(
+                config.encoder.transformer_path,
+                device="cpu",
+            )
+            model_for_load = getattr(self.model_parts[0], "_orig_mod", self.model_parts[0])
+            model_keys = set(get_model_state_dict(model_for_load).keys())
+            checkpoint_keys = set(state_dict.keys())
+            missing_keys = sorted(model_keys - checkpoint_keys)
+            unexpected_keys = sorted(checkpoint_keys - model_keys)
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    "Failed to load FLUX.2 transformer checkpoint cleanly. "
+                    f"Missing keys: {missing_keys[:10]} Unexpected keys: {unexpected_keys[:10]}"
+                )
+            set_model_state_dict(
+                model_for_load,
+                model_state_dict=state_dict,
+                options=StateDictOptions(full_state_dict=True, strict=False),
+            )
 
         dist_utils.set_determinism(
             self.parallel_dims,
@@ -254,3 +296,14 @@ class Flux2Trainer(Trainer):
                 "lr": lr,
             },
         )
+
+
+
+def main() -> None:
+    from torchtitan.train import main as train_main
+
+    train_main()
+
+
+if __name__ == "__main__":
+    main()

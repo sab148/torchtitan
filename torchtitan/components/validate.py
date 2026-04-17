@@ -19,12 +19,20 @@ from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import Configurable, ParallelismConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
-from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 
 ValidationContext: TypeAlias = Callable[[], AbstractContextManager[None]]
+
+
+def _default_validation_dataloader_config() -> BaseDataLoader.Config:
+    from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
+
+    return HuggingFaceTextDataLoader.Config(
+        dataset="c4_validation",
+        infinite=False,
+    )
 
 
 class BaseValidator(Configurable):
@@ -80,10 +88,7 @@ class Validator(BaseValidator):
         """
 
         dataloader: BaseDataLoader.Config = field(
-            default_factory=lambda: HuggingFaceTextDataLoader.Config(
-                dataset="c4_validation",
-                infinite=False,
-            )
+            default_factory=BaseDataLoader.Config
         )
         """DataLoader configuration for validation"""
 
@@ -91,6 +96,8 @@ class Validator(BaseValidator):
             assert (
                 self.steps > 0 or self.steps == -1
             ), "validation steps must be positive or -1"
+            if self.enable and type(self.dataloader) is BaseDataLoader.Config:
+                self.dataloader = _default_validation_dataloader_config()
 
     validation_dataloader: BaseDataLoader
 

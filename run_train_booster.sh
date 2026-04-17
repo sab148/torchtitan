@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --account=nxtaim-1
-#SBATCH --nodes=1
+#SBATCH --nodes=4
 #SBATCH --partition=develbooster
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32  # 80 physical cores per node.
-#SBATCH --time=00:15:00
+#SBATCH --time=02:00:00
 #SBATCH --gres=gpu:4
 #SBATCH -o cache/slurm_output/%j_%a.log  # %j will be replaced by the job ID, %a by array index
 #SBATCH --array=1
@@ -12,7 +12,7 @@
 set -x
 ulimit -c 0
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR="${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 
 # Without this, srun does not inherit cpus-per-task from sbatch.
 echo "----------------------------------"
@@ -47,14 +47,14 @@ export WANDB_MODE=offline
 # train_config="moe_opt_g_5T.toml"
 RUN_NAME=${RUN_NAME:-"flux2-train"}
 export MODULE=${MODULE:-"flux2"}
-export CONFIG=${CONFIG:-"flux2_klein_4b"}
+export CONFIG=${CONFIG:-"flux2_klein_4b_dataconsolidation"}
 
 # it will run on 4096 seqlen, local BS = 12, steps = 79473.  Should run 256 GPUS to be total of 1T tokens 
 
-steps=100
+steps=${STEPS:-30000}
 # BS=9
 # gradient_accumulation_steps=3
-BS=10
+BS=${BS:-4}
 gradient_accumulation_steps=1
 total_BS=$((BS * gradient_accumulation_steps * GPUS_PER_NODE * NUM_NODES))
 # total_BS=10368
