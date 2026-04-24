@@ -1,0 +1,62 @@
+[job]
+dump_folder = "./outputs"
+description = "Flux.2 dev model"
+custom_config_module = "torchtitan.models.flux2.job_config"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 10
+enable_memory_snapshot = false
+save_memory_snapshot_folder = "memory_snapshot"
+
+[metrics]
+log_freq = 100
+disable_color_printing = false
+enable_tensorboard = false
+save_tb_folder = "tb"
+enable_wandb = false
+
+[model]
+name = "flux2"
+flavor = "flux.2-dev"
+
+[optimizer]
+name = "AdamW"
+lr = 1e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 3000
+decay_ratio = 0.0
+
+[training]
+local_batch_size = 1
+max_norm = 1.0
+steps = 30000
+dataset = "cc12m-wds"
+classifier_free_guidance_prob = 0.0
+img_size = 256
+guidance = 4.0
+
+[encoder]
+autoencoder_path = "assets/hf/FLUX.2-dev/ae.safetensors"
+max_text_encoding_len = 512
+
+[parallelism]
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = -1
+
+[activation_checkpoint]
+mode = "full"
+
+[checkpoint]
+enable = false
+folder = "checkpoint"
+interval = 1000
+last_save_model_only = true
+export_dtype = "float32"
+async_mode = "disabled"
+
+[validation]
+enable = false
