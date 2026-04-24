@@ -27,6 +27,7 @@ from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.experiments.rl.models.attention import VLLMAttentionWrapper
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.protocols.module import Module
+from vllm.compilation import codegen as _codegen
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -52,6 +53,32 @@ def _dtensor_safe_weak_ref_tensor(tensor):
 
 
 _torch_utils.weak_ref_tensor = _dtensor_safe_weak_ref_tensor
+
+
+# NOTE: Monkeypatch vLLM's _node_ref to handle DTensor placement types
+# whose repr() uses unqualified class names not available in the generated
+# code's exec namespace (which only has `import torch`).
+_original_node_ref = _codegen._node_ref
+
+# TODO: Followup with core vLLM fix
+# https://github.com/pytorch/torchtitan/issues/3067
+def _patched_node_ref(arg):
+    try:
+        from torch.distributed.tensor.placement_types import Partial, Placement
+
+        if isinstance(arg, Placement):
+            cls = type(arg)
+            # Partial.__repr__ leaves reduce_op unquoted (e.g. "Partial(sum)")
+            # which would resolve to the builtin sum, not the string "sum".
+            if isinstance(arg, Partial):
+                return f"{cls.__module__}.{cls.__name__}({arg.reduce_op!r})"
+            return f"{cls.__module__}.{repr(arg)}"
+    except ImportError:
+        pass
+    return _original_node_ref(arg)
+
+
+_codegen._node_ref = _patched_node_ref
 
 
 def create_torchtitan_config_from_vllm_config(
@@ -152,7 +179,7 @@ class TorchTitanVLLMModelWrapper(Module):
 
         # Replace inner_attention with VLLMAttentionWrapper in config
         model_config = model_spec.model
-        attn_config = model_config.layer.attention
+        attn_config = model_config.layers[0].attention
         n_heads = attn_config.n_heads
         n_kv_heads = attn_config.n_kv_heads or n_heads
         head_dim = (
@@ -166,9 +193,16 @@ class TorchTitanVLLMModelWrapper(Module):
             num_kv_heads=n_kv_heads,
             head_dim=head_dim,
         )
-        new_attn = dataclasses.replace(attn_config, inner_attention=vllm_backend)
-        new_layer = dataclasses.replace(model_config.layer, attention=new_attn)
-        self.config = dataclasses.replace(model_config, layer=new_layer)
+        new_layers = [
+            dataclasses.replace(
+                layer_cfg,
+                attention=dataclasses.replace(
+                    layer_cfg.attention, inner_attention=vllm_backend
+                ),
+            )
+            for layer_cfg in model_config.layers
+        ]
+        self.config = dataclasses.replace(model_config, layers=new_layers)
         logger.debug(f"Creating model with config: {self.config.to_dict()}")
 
         # TODO: Check if it's possible to apply meta init

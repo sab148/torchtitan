@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import operator
+from unittest.mock import patch
 
 import torch
 from torch._functorch.aot_autograd import aot_compile_joint_with_descriptors
@@ -12,18 +13,39 @@ from torch._guards import tracing
 from torch._inductor.fx_passes.bucketing import (
     is_all_gather_into_tensor as is_all_gather,
 )
+from torch.cuda._graph_annotations import _is_tools_id_unavailable
+from torch.fx.experimental.proxy_tensor import make_fx
+from torch.fx.traceback import preserve_node_meta
 from torch.testing._internal.common_fsdp import FSDPTest
 from torch.testing._internal.common_utils import TestCase
 from torch.utils.checkpoint import checkpoint, CheckpointPolicy
 
 from torchtitan.distributed import ParallelDims
-from torchtitan.experiments.graph_trainer.common_utils import _AC_REGION_ID
+from torchtitan.experiments.graph_trainer.common_utils import (
+    _MODULE_FQN,
+    annotate_module_fqns,
+)
 from torchtitan.experiments.graph_trainer.graph_utils import export_joint
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    minimal_fx_tracer,
+    trace_train_step,
+)
 from torchtitan.experiments.graph_trainer.passes import (
+    _make_default_memory_policy,
     apply_sac_pass,
+    insert_kernel_annotations_pass,
     reassign_to_pg_pass,
+    remove_detach_pass,
+    remove_identity_slice_pass,
+    remove_identity_view_pass,
 )
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+from torchtitan.experiments.graph_trainer.tests.test_cpu_offload import (  # noqa: F401
+    TestCpuOffloadPass,
+)
+from torchtitan.experiments.graph_trainer.tests.test_custom_codegen import (  # noqa: F401
+    TestCustomCodegenPass,
+)
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module, ModuleList
 
@@ -35,13 +57,12 @@ class ToyModel(Module):
 
     def __init__(self, dim=16, n_layers=3):
         super().__init__()
-        linear_config = Linear.Config(bias=True)
-        self.layers = ModuleList(
-            [
-                linear_config.build(in_features=dim, out_features=dim)
-                for _ in range(n_layers)
-            ]
-        )
+
+        def _make_linear():
+            cfg = Linear.Config(in_features=dim, out_features=dim, bias=True)
+            return cfg.build()
+
+        self.layers = ModuleList([_make_linear() for _ in range(n_layers)])
 
     def forward(self, x):
         for layer in self.layers:
@@ -134,7 +155,12 @@ class TestReassignToPgPass(FSDPTest):
         self.assertGreater(ag_before, 0, "Expected AG nodes with FSDP PG name")
 
         # Apply the pass
-        reassign_to_pg_pass(bw_gm, bw_example_inputs, fsdp_pg_name, target_pg_name)
+        reassign_to_pg_pass(
+            bw_gm,
+            bw_example_inputs,
+            source_pg_name=fsdp_pg_name,
+            target_pg_name=target_pg_name,
+        )
 
         # After: AG nodes should use the target PG
         ag_with_old = self._count_ag_nodes_with_pg(bw_gm, fsdp_pg_name)
@@ -155,7 +181,12 @@ class TestReassignToPgPass(FSDPTest):
         bw_gm, bw_example_inputs = self._export_and_get_bw_graph(model, inputs)
 
         total_before = self._count_all_ag_nodes(bw_gm)
-        reassign_to_pg_pass(bw_gm, bw_example_inputs, fsdp_pg_name, "new_pg")
+        reassign_to_pg_pass(
+            bw_gm,
+            bw_example_inputs,
+            source_pg_name=fsdp_pg_name,
+            target_pg_name="new_pg",
+        )
         total_after = self._count_all_ag_nodes(bw_gm)
 
         self.assertEqual(total_before, total_after)
@@ -172,7 +203,12 @@ class TestReassignToPgPass(FSDPTest):
         ag_before = self._count_ag_nodes_with_pg(bw_gm, fsdp_pg_name)
 
         # Use a non-matching source PG name
-        reassign_to_pg_pass(bw_gm, bw_example_inputs, "nonexistent_pg", "target_pg")
+        reassign_to_pg_pass(
+            bw_gm,
+            bw_example_inputs,
+            source_pg_name="nonexistent_pg",
+            target_pg_name="target_pg",
+        )
 
         # FSDP AG nodes should be unchanged
         ag_after = self._count_ag_nodes_with_pg(bw_gm, fsdp_pg_name)
@@ -201,7 +237,12 @@ class TestReassignToPgPass(FSDPTest):
         self.assertGreater(ag_before, 0)
 
         # Reassign to the real extra PG
-        reassign_to_pg_pass(bw_gm, bw_example_inputs, fsdp_pg_name, extra_pg_name)
+        reassign_to_pg_pass(
+            bw_gm,
+            bw_example_inputs,
+            source_pg_name=fsdp_pg_name,
+            target_pg_name=extra_pg_name,
+        )
 
         ag_old = self._count_ag_nodes_with_pg(bw_gm, fsdp_pg_name)
         ag_new = self._count_ag_nodes_with_pg(bw_gm, extra_pg_name)
@@ -231,7 +272,10 @@ class TestApplySACPass(TestCase):
                 # If the next op is getitem, wrap in a tuple so getitem has
                 # a proper tuple/list input.
                 if i + 1 < len(op_targets) and op_targets[i + 1] is operator.getitem:
-                    _make_tuple = lambda x: (x, x)
+
+                    def _make_tuple(x):
+                        return (x, x)
+
                     last = graph.call_function(_make_tuple, args=(last,))
         graph.output(last)
         return torch.fx.GraphModule(torch.nn.Module(), graph)
@@ -256,13 +300,13 @@ class TestApplySACPass(TestCase):
         """Non-mm ops in the save list should be marked MUST_SAVE."""
         custom_save = {torch.ops.aten.add.Tensor}
         gm = self._build_gm([torch.ops.aten.add.Tensor])
-        apply_sac_pass(gm, op_list_to_save=custom_save)
+        apply_sac_pass(gm, policy_fn=_make_default_memory_policy(custom_save))
         nodes = self._get_call_function_nodes(gm)
         self.assertEqual(len(nodes), 1)
         self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
     def test_getitem_propagates_parent_tags(self):
-        """operator.getitem nodes should inherit the parent's recompute tag and ac_graph_id."""
+        """operator.getitem nodes should inherit the parent's recompute tag."""
         gm = self._build_gm(
             [
                 torch.ops.aten.add.Tensor,
@@ -276,19 +320,14 @@ class TestApplySACPass(TestCase):
         self.assertEqual(nodes[0].target, torch.ops.aten.add.Tensor)
         self.assertEqual(nodes[2].target, operator.getitem)
 
-        # Set ac_region_id on the tuple-returning parent (the direct parent of getitem)
-        nodes[1].meta["custom"] = {_AC_REGION_ID: 3}
-
         apply_sac_pass(gm)
 
         tuple_node = nodes[1]
         getitem_node = nodes[2]
         self.assertEqual(getitem_node.meta["recompute"], tuple_node.meta["recompute"])
-        self.assertEqual(tuple_node.meta["ac_graph_id"], 3)
-        self.assertEqual(getitem_node.meta["ac_graph_id"], 3)
 
     def test_wait_tensor_propagates_parent_tags(self):
-        """wait_tensor nodes should inherit the parent's recompute tag and ac_graph_id."""
+        """wait_tensor nodes should inherit the parent's recompute tag."""
         custom_save = {torch.ops._c10d_functional.reduce_scatter_tensor.default}
         gm = self._build_gm(
             [
@@ -297,33 +336,17 @@ class TestApplySACPass(TestCase):
             ]
         )
         nodes = self._get_call_function_nodes(gm)
-        nodes[0].meta["custom"] = {_AC_REGION_ID: 3}
+        nodes[0].meta["custom"] = {_MODULE_FQN: "layers.3.attention"}
 
-        apply_sac_pass(gm, op_list_to_save=custom_save)
+        apply_sac_pass(gm, policy_fn=_make_default_memory_policy(custom_save))
 
         rs_node = nodes[0]
         wait_node = nodes[1]
         self.assertEqual(rs_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
         self.assertEqual(wait_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
-        self.assertEqual(rs_node.meta["ac_graph_id"], 3)
-        self.assertEqual(wait_node.meta["ac_graph_id"], 3)
 
-    def test_ac_graph_id_defaults_to_zero(self):
-        """Nodes without ac_region_id annotation should have ac_graph_id = 0."""
-        gm = self._build_gm(
-            [
-                torch.ops.aten.add.Tensor,
-                torch.ops.aten.mm.default,
-                torch.ops.aten.relu.default,
-            ]
-        )
-        apply_sac_pass(gm)
-        for node in self._get_call_function_nodes(gm):
-            if node.target is not operator.getitem:
-                self.assertEqual(node.meta["ac_graph_id"], 0)
-
-    def test_ac_graph_id_from_annotation(self):
-        """Nodes with _AC_REGION_ID_KEY in custom metadata should use that as ac_graph_id."""
+    def test_boundary_nodes_forced_to_must_save(self):
+        """Nodes at AC region boundaries should be forced to MUST_SAVE."""
         gm = self._build_gm(
             [
                 torch.ops.aten.add.Tensor,
@@ -331,14 +354,14 @@ class TestApplySACPass(TestCase):
             ]
         )
         nodes = self._get_call_function_nodes(gm)
-        # Simulate annotate_fn setting custom metadata on different nodes
-        nodes[0].meta["custom"] = {_AC_REGION_ID: 1}
-        nodes[1].meta["custom"] = {_AC_REGION_ID: 2}
+        nodes[0].meta["custom"] = {_MODULE_FQN: "layers.0.feed_forward"}
+        nodes[1].meta["custom"] = {_MODULE_FQN: "layers.1.attention"}
 
         apply_sac_pass(gm)
 
-        self.assertEqual(nodes[0].meta["ac_graph_id"], 1)
-        self.assertEqual(nodes[1].meta["ac_graph_id"], 2)
+        # add is at the boundary (layer 0 -> layer 1), forced to MUST_SAVE
+        self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
 
     def test_custom_op_list_to_save(self):
         """A custom op_list_to_save should override the defaults."""
@@ -349,7 +372,7 @@ class TestApplySACPass(TestCase):
                 torch.ops.aten.relu.default,
             ]
         )
-        apply_sac_pass(gm, op_list_to_save=custom_save)
+        apply_sac_pass(gm, policy_fn=_make_default_memory_policy(custom_save))
         policies = {
             n.target: n.meta["recompute"] for n in self._get_call_function_nodes(gm)
         }
@@ -365,19 +388,19 @@ class TestApplySACPass(TestCase):
         custom_save = {torch.ops.aten.mm.default, torch.ops.aten.max.default}
         gm = self._build_gm(
             [
-                torch.ops.aten.mm.default,  # 1st mm -> MUST_SAVE
+                torch.ops.aten.mm.default,  # in save list -> MUST_SAVE
                 torch.ops.aten.max.default,  # in save list -> MUST_SAVE
-                torch.ops.aten.mm.default,  # 2nd mm -> PREFER_RECOMPUTE
+                torch.ops.aten.mm.default,  # in save list -> MUST_SAVE
                 torch.ops.aten.add.Tensor,  # not in save list -> PREFER_RECOMPUTE
-                torch.ops.aten.mm.default,  # 3rd mm -> MUST_SAVE
+                torch.ops.aten.mm.default,  # in save list -> MUST_SAVE
             ]
         )
-        apply_sac_pass(gm, op_list_to_save=custom_save)
+        apply_sac_pass(gm, policy_fn=_make_default_memory_policy(custom_save))
         nodes = self._get_call_function_nodes(gm)
         expected = [
             (torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE),
             (torch.ops.aten.max.default, CheckpointPolicy.MUST_SAVE),
-            (torch.ops.aten.mm.default, CheckpointPolicy.PREFER_RECOMPUTE),
+            (torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE),
             (torch.ops.aten.add.Tensor, CheckpointPolicy.PREFER_RECOMPUTE),
             (torch.ops.aten.mm.default, CheckpointPolicy.MUST_SAVE),
         ]
@@ -385,6 +408,859 @@ class TestApplySACPass(TestCase):
         for node, (target, policy) in zip(nodes, expected):
             self.assertEqual(node.target, target)
             self.assertEqual(node.meta["recompute"], policy, f"node {node.name}")
+
+
+class TestBucketingPrefetchOrder(FSDPTest):
+    """Guard that SAC + bucketing produces correct all_gather prefetch order.
+
+    Uses the real Llama3 debug model with FSDP via the GraphTrainer path.
+    Verifies that bucketed all_gather starts follow forward layer order
+    (0, 1, 2, ...) and not reverse order (which was a prior bug).
+    """
+
+    BATCH_SIZE = 4
+    SEQ_LEN = 128
+
+    @staticmethod
+    def _get_bucketed_ag_layer_order(gm):
+        """Extract layer IDs from bucketed all_gather_into_tensor_out nodes.
+
+        For each bucketed all_gather, searches its transitive users for
+        a node with module_fqn under ``layers.<N>`` and records N.
+        Returns deduplicated layer IDs in graph order.
+        """
+        layer_ids = []
+        for node in gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if "all_gather_into_tensor_out" not in str(node.target):
+                continue
+            # BFS through users to find a node with layers.N FQN
+            visited = set()
+            queue = list(node.users)
+            found_lid = None
+            while queue and found_lid is None:
+                u = queue.pop(0)
+                if u in visited:
+                    continue
+                visited.add(u)
+                fqn = u.meta.get("custom", {}).get(_MODULE_FQN, "")
+                parts = fqn.split(".")
+                if parts[0] == "layers" and len(parts) >= 2:
+                    try:
+                        found_lid = int(parts[1])
+                    except ValueError:
+                        pass
+                else:
+                    queue.extend(u.users)
+            if found_lid is not None and (not layer_ids or layer_ids[-1] != found_lid):
+                layer_ids.append(found_lid)
+        return layer_ids
+
+    def test_forward_allgather_prefetch_follows_layer_order(self):
+        """Bucketed forward all_gather starts must appear in layer order 0→N."""
+        from torchtitan.components.tokenizer import HuggingFaceTokenizer
+        from torchtitan.experiments.graph_trainer.llama3 import (
+            model_registry as llama3_model_registry,
+        )
+        from torchtitan.experiments.graph_trainer.llama3.parallelize import (
+            annotate_llama,
+        )
+        from torchtitan.experiments.graph_trainer.simple_fsdp import (
+            data_parallel,
+            MixedPrecisionPolicy,
+        )
+        from torchtitan.experiments.graph_trainer.tests._trainer_test_utils import (
+            build_minimal_trainer,
+        )
+        from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+
+        parallel_dims = ParallelDims(
+            dp_shard=-1,
+            dp_replicate=1,
+            cp=1,
+            tp=1,
+            pp=1,
+            ep=1,
+            etp=1,
+            world_size=self.world_size,
+        )
+
+        model_spec = llama3_model_registry("debugmodel")
+        model_config = model_spec.model
+        vocab_size = model_config.vocab_size
+
+        with torch.device("meta"):
+            model = model_config.build()
+
+        annotate_llama(model)
+        fsdp_mesh = parallel_dims.get_mesh("fsdp")
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+        model = data_parallel(
+            model, device_mesh=fsdp_mesh, mode="fully_shard", mp_policy=mp_policy
+        )
+        model.to_empty(device="cuda")
+        with torch.no_grad():
+            model.init_states(buffer_device=None)
+        model.train()
+
+        # Use GraphTrainer's full path: trace + construct_default_graph_passes
+        trainer = build_minimal_trainer(
+            model,
+            model_config,
+            GraphTrainer,
+            tokenizer=HuggingFaceTokenizer(tokenizer_path="./tests/assets/tokenizer"),
+        )
+
+        inputs = torch.randint(
+            0, vocab_size, (self.BATCH_SIZE, self.SEQ_LEN), device="cuda"
+        )
+        labels = torch.randint(
+            0, vocab_size, (self.BATCH_SIZE, self.SEQ_LEN), device="cuda"
+        )
+        global_valid_tokens = torch.tensor(
+            self.BATCH_SIZE * self.SEQ_LEN, dtype=torch.float, device="cuda"
+        )
+
+        # One forward_backward_step triggers _make_fx_forward_backward_step
+        # which traces the model and applies all graph passes.
+        trainer.forward_backward_step(
+            input_dict={"input": inputs},
+            labels=labels,
+            global_valid_tokens=global_valid_tokens,
+        )
+
+        layer_ids = self._get_bucketed_ag_layer_order(trainer._traced_step.gm)
+        self.assertGreater(len(layer_ids), 0, "No layer all_gather nodes found")
+
+        # Forward layer order must be monotonically non-decreasing
+        for i in range(1, len(layer_ids)):
+            self.assertGreaterEqual(
+                layer_ids[i],
+                layer_ids[i - 1],
+                f"Forward all_gather prefetch order violated: "
+                f"layer {layer_ids[i]} before layer {layer_ids[i - 1]} "
+                f"(full order: {layer_ids})",
+            )
+
+
+class TestRemoveDetachPass(TestCase):
+    """Unit tests for the remove_detach_pass graph pass."""
+
+    def _build_detach_gm(self, op_targets):
+        """Build a GraphModule with a chain of call_function nodes.
+
+        Each op in op_targets becomes a call_function node chained sequentially:
+        placeholder(x) -> op1(x) -> op2(...) -> ... -> output.
+        """
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        last = x
+        for target in op_targets:
+            last = graph.call_function(target, args=(last,))
+        graph.output(last)
+        return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    def _count_detach_nodes(self, gm):
+        """Count aten.detach.default call_function nodes."""
+        return sum(
+            1
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target is torch.ops.aten.detach.default
+        )
+
+    def _count_call_function_nodes(self, gm):
+        """Count all call_function nodes."""
+        return sum(1 for n in gm.graph.nodes if n.op == "call_function")
+
+    def test_detach_nodes_removed(self):
+        """Detach nodes are removed from a simple graph containing them."""
+        gm = self._build_detach_gm(
+            [
+                torch.ops.aten.relu.default,
+                torch.ops.aten.detach.default,
+                torch.ops.aten.neg.default,
+            ]
+        )
+        self.assertEqual(self._count_detach_nodes(gm), 1)
+
+        result = remove_detach_pass(gm)
+
+        self.assertEqual(self._count_detach_nodes(result), 0)
+        # relu and neg should remain
+        self.assertEqual(self._count_call_function_nodes(result), 2)
+
+    def test_graph_without_detach_unchanged(self):
+        """Graphs without detach nodes are returned unchanged."""
+        gm = self._build_detach_gm(
+            [
+                torch.ops.aten.relu.default,
+                torch.ops.aten.neg.default,
+            ]
+        )
+        num_nodes_before = len(list(gm.graph.nodes))
+
+        result = remove_detach_pass(gm)
+
+        self.assertIs(result, gm)
+        self.assertEqual(len(list(result.graph.nodes)), num_nodes_before)
+
+    def test_numerics_preserved(self):
+        """Forward outputs are preserved after removing detach nodes."""
+        gm = self._build_detach_gm(
+            [
+                torch.ops.aten.relu.default,
+                torch.ops.aten.detach.default,
+                torch.ops.aten.neg.default,
+            ]
+        )
+        x = torch.randn(4, 4)
+        expected = torch.neg(torch.detach_copy(torch.relu(x)))
+
+        remove_detach_pass(gm)
+        actual = gm(x)
+
+        self.assertEqual(actual, expected)
+
+    def test_detach_with_multiple_users(self):
+        """Detach node with multiple users: all uses are replaced."""
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        detach = graph.call_function(torch.ops.aten.detach.default, args=(x,))
+        relu = graph.call_function(torch.ops.aten.relu.default, args=(detach,))
+        neg = graph.call_function(torch.ops.aten.neg.default, args=(detach,))
+        graph.output((relu, neg))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        self.assertEqual(self._count_detach_nodes(gm), 1)
+
+        remove_detach_pass(gm)
+
+        self.assertEqual(self._count_detach_nodes(gm), 0)
+
+        # Both relu and neg should now consume the placeholder directly
+        for node in gm.graph.nodes:
+            if node.op == "call_function" and node.target in (
+                torch.ops.aten.relu.default,
+                torch.ops.aten.neg.default,
+            ):
+                self.assertEqual(node.args[0].op, "placeholder")
+
+        # Verify numerics
+        x = torch.randn(4, 4)
+        relu_out, neg_out = gm(x)
+        self.assertEqual(relu_out, torch.relu(x))
+        self.assertEqual(neg_out, torch.neg(x))
+
+    def test_nested_detach_chain(self):
+        """Nested detach chain (detach -> detach -> detach) is fully removed."""
+        gm = self._build_detach_gm(
+            [
+                torch.ops.aten.relu.default,
+                torch.ops.aten.detach.default,
+                torch.ops.aten.detach.default,
+                torch.ops.aten.detach.default,
+                torch.ops.aten.neg.default,
+            ]
+        )
+        self.assertEqual(self._count_detach_nodes(gm), 3)
+
+        remove_detach_pass(gm)
+
+        self.assertEqual(self._count_detach_nodes(gm), 0)
+        self.assertEqual(self._count_call_function_nodes(gm), 2)
+
+        # Verify numerics
+        x = torch.randn(4, 4)
+        expected = torch.neg(torch.relu(x))
+        self.assertEqual(gm(x), expected)
+
+
+class TestRemoveIdentityViewPass(TestCase):
+    """Unit tests for the remove_identity_view_pass graph pass."""
+
+    _VIEW_TARGETS = [
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+    ]
+
+    def _build_view_gm(self, op_targets, *, shapes=None):
+        """Build a GraphModule with a chain of call_function nodes.
+
+        Each op in ``op_targets`` becomes a call_function node chained
+        sequentially: placeholder(x) -> op1(x, shape) -> op2(..., shape) -> output.
+
+        If ``shapes`` is provided it must have the same length as
+        ``op_targets`` and supplies the shape argument for each view-like
+        node.  Non-view nodes ignore the corresponding entry.
+        """
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        last = x
+        for i, target in enumerate(op_targets):
+            if target in (
+                torch.ops.aten.view.default,
+                torch.ops.aten.reshape.default,
+                torch.ops.aten._unsafe_view.default,
+            ):
+                shape = shapes[i] if shapes else [4, 4]
+                last = graph.call_function(target, args=(last, shape))
+            else:
+                last = graph.call_function(target, args=(last,))
+        graph.output(last)
+        return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    def _attach_fake_meta(self, gm, input_shape):
+        """Attach fake tensor metadata to all nodes based on op semantics."""
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            fake_input = torch.randn(input_shape)
+        for node in gm.graph.nodes:
+            if node.op == "placeholder":
+                node.meta["val"] = fake_input
+            elif node.op == "call_function":
+                if node.target in (
+                    torch.ops.aten.view.default,
+                    torch.ops.aten.reshape.default,
+                    torch.ops.aten._unsafe_view.default,
+                ):
+                    target_shape = node.args[1]
+                    with fake_mode:
+                        node.meta["val"] = torch.randn(target_shape)
+                else:
+                    # For unary ops like relu/neg, output shape == input shape.
+                    node.meta["val"] = node.args[0].meta.get("val")
+
+    def _count_view_nodes(self, gm):
+        """Count view/reshape/_unsafe_view call_function nodes."""
+        targets = {
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            torch.ops.aten._unsafe_view.default,
+        }
+        return sum(
+            1 for n in gm.graph.nodes if n.op == "call_function" and n.target in targets
+        )
+
+    def _count_call_function_nodes(self, gm):
+        """Count all call_function nodes."""
+        return sum(1 for n in gm.graph.nodes if n.op == "call_function")
+
+    def test_identity_view_removed(self):
+        """Identity view (same shape in and out) is removed for each op type."""
+        for target in self._VIEW_TARGETS:
+            with self.subTest(target=target):
+                gm = self._build_view_gm(
+                    [torch.ops.aten.relu.default, target, torch.ops.aten.neg.default],
+                    shapes=[None, [4, 4], None],
+                )
+                self._attach_fake_meta(gm, (4, 4))
+                self.assertEqual(self._count_view_nodes(gm), 1)
+
+                result = remove_identity_view_pass(gm)
+
+                self.assertEqual(self._count_view_nodes(result), 0)
+                self.assertEqual(self._count_call_function_nodes(result), 2)
+
+    def test_non_identity_view_preserved(self):
+        """Non-identity view (shape changes) is kept."""
+        gm = self._build_view_gm(
+            [torch.ops.aten.view.default],
+            shapes=[[2, 8]],
+        )
+        self._attach_fake_meta(gm, (4, 4))
+        self.assertEqual(self._count_view_nodes(gm), 1)
+
+        remove_identity_view_pass(gm)
+
+        self.assertEqual(self._count_view_nodes(gm), 1)
+
+    def test_view_without_metadata_skipped(self):
+        """Nodes without tensor metadata are skipped safely."""
+        gm = self._build_view_gm(
+            [torch.ops.aten.view.default],
+            shapes=[[4, 4]],
+        )
+        # Do NOT attach fake meta — nodes have no "val" in meta.
+
+        # Should not raise and should not modify the graph.
+        remove_identity_view_pass(gm)
+
+        self.assertEqual(self._count_view_nodes(gm), 1)
+
+    def test_numerics_preserved(self):
+        """Forward outputs are preserved after removing identity views."""
+        gm = self._build_view_gm(
+            [
+                torch.ops.aten.relu.default,
+                torch.ops.aten.view.default,
+                torch.ops.aten.neg.default,
+            ],
+            shapes=[None, [4, 4], None],
+        )
+        self._attach_fake_meta(gm, (4, 4))
+
+        x = torch.randn(4, 4)
+        expected = torch.neg(torch.relu(x).view(4, 4))
+
+        remove_identity_view_pass(gm)
+        actual = gm(x)
+
+        self.assertEqual(actual, expected)
+
+    def test_view_with_multiple_users(self):
+        """Identity view with multiple users: all uses are replaced."""
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        view = graph.call_function(torch.ops.aten.view.default, args=(x, [4, 4]))
+        relu = graph.call_function(torch.ops.aten.relu.default, args=(view,))
+        neg = graph.call_function(torch.ops.aten.neg.default, args=(view,))
+        graph.output((relu, neg))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        # Attach metadata
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            fake_input = torch.randn(4, 4)
+        for node in gm.graph.nodes:
+            if node.op == "placeholder":
+                node.meta["val"] = fake_input
+            elif node.target is torch.ops.aten.view.default:
+                node.meta["val"] = fake_input  # same shape
+            elif node.op == "call_function":
+                node.meta["val"] = fake_input
+
+        self.assertEqual(self._count_view_nodes(gm), 1)
+
+        remove_identity_view_pass(gm)
+
+        self.assertEqual(self._count_view_nodes(gm), 0)
+
+        # Both relu and neg should now consume the placeholder directly
+        for node in gm.graph.nodes:
+            if node.op == "call_function" and node.target in (
+                torch.ops.aten.relu.default,
+                torch.ops.aten.neg.default,
+            ):
+                self.assertEqual(node.args[0].op, "placeholder")
+
+        # Verify numerics
+        x = torch.randn(4, 4)
+        relu_out, neg_out = gm(x)
+        self.assertEqual(relu_out, torch.relu(x))
+        self.assertEqual(neg_out, torch.neg(x))
+
+    def test_chain_of_identity_views(self):
+        """Chain of identity views (view -> view -> view) is fully removed."""
+        gm = self._build_view_gm(
+            [
+                torch.ops.aten.relu.default,
+                torch.ops.aten.view.default,
+                torch.ops.aten.reshape.default,
+                torch.ops.aten._unsafe_view.default,
+                torch.ops.aten.neg.default,
+            ],
+            shapes=[None, [4, 4], [4, 4], [4, 4], None],
+        )
+        self._attach_fake_meta(gm, (4, 4))
+        self.assertEqual(self._count_view_nodes(gm), 3)
+
+        remove_identity_view_pass(gm)
+
+        self.assertEqual(self._count_view_nodes(gm), 0)
+        self.assertEqual(self._count_call_function_nodes(gm), 2)
+
+        # Verify numerics
+        x = torch.randn(4, 4)
+        expected = torch.neg(torch.relu(x))
+        self.assertEqual(gm(x), expected)
+
+    def test_graph_without_views_unchanged(self):
+        """Graphs without view nodes are returned unchanged."""
+        gm = self._build_view_gm(
+            [torch.ops.aten.relu.default, torch.ops.aten.neg.default],
+            shapes=[None, None],
+        )
+        self._attach_fake_meta(gm, (4, 4))
+        num_nodes_before = len(list(gm.graph.nodes))
+
+        result = remove_identity_view_pass(gm)
+
+        self.assertIs(result, gm)
+        self.assertEqual(len(list(result.graph.nodes)), num_nodes_before)
+
+
+class TestRemoveIdentitySlicePass(TestCase):
+    """Unit tests for the remove_identity_slice_pass graph pass."""
+
+    def _build_slice_gm(self, input_shape, dim, start, end, step=1):
+        """Build a GraphModule with a single aten.slice.Tensor node.
+
+        Creates: placeholder(x) -> slice(x, dim, start, end, step) -> output.
+        The placeholder is annotated with fake tensor metadata of the given shape.
+        """
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        sliced = graph.call_function(
+            torch.ops.aten.slice.Tensor, args=(x, dim, start, end, step)
+        )
+        graph.output(sliced)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        # Annotate placeholder with fake tensor metadata
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode() as fake_mode:
+            fake_val = fake_mode.from_tensor(torch.empty(*input_shape))
+        for node in gm.graph.nodes:
+            if node.op == "placeholder":
+                node.meta["val"] = fake_val
+        return gm
+
+    def _count_slice_nodes(self, gm):
+        """Count aten.slice.Tensor nodes in the graph."""
+        return sum(
+            1
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target is torch.ops.aten.slice.Tensor
+        )
+
+    def test_full_dim_slice_is_removed(self):
+        """A slice selecting the full dimension (start=0, end>=dim_size, step=1)
+        should be removed."""
+        gm = self._build_slice_gm(input_shape=(8, 16), dim=0, start=0, end=8, step=1)
+        self.assertEqual(self._count_slice_nodes(gm), 1)
+
+        remove_identity_slice_pass(gm)
+        self.assertEqual(self._count_slice_nodes(gm), 0)
+
+    def test_full_dim_slice_large_end_is_removed(self):
+        """A slice with end > dim_size should also be removed (identity)."""
+        import sys
+
+        gm = self._build_slice_gm(
+            input_shape=(8, 16), dim=0, start=0, end=sys.maxsize, step=1
+        )
+        self.assertEqual(self._count_slice_nodes(gm), 1)
+
+        remove_identity_slice_pass(gm)
+        self.assertEqual(self._count_slice_nodes(gm), 0)
+
+    def test_partial_slice_start_preserved(self):
+        """A slice with start > 0 is not an identity and should be preserved."""
+        gm = self._build_slice_gm(input_shape=(8, 16), dim=0, start=2, end=8, step=1)
+        remove_identity_slice_pass(gm)
+        self.assertEqual(self._count_slice_nodes(gm), 1)
+
+    def test_partial_slice_end_preserved(self):
+        """A slice with end < dim_size is not an identity and should be preserved."""
+        gm = self._build_slice_gm(input_shape=(8, 16), dim=0, start=0, end=4, step=1)
+        remove_identity_slice_pass(gm)
+        self.assertEqual(self._count_slice_nodes(gm), 1)
+
+    def test_partial_slice_step_preserved(self):
+        """A slice with step > 1 is not an identity and should be preserved."""
+        gm = self._build_slice_gm(input_shape=(8, 16), dim=0, start=0, end=8, step=2)
+        remove_identity_slice_pass(gm)
+        self.assertEqual(self._count_slice_nodes(gm), 1)
+
+    def test_no_metadata_skipped(self):
+        """Slice nodes without fake tensor metadata should be skipped safely."""
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        sliced = graph.call_function(
+            torch.ops.aten.slice.Tensor, args=(x, 0, 0, 100, 1)
+        )
+        graph.output(sliced)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        # No metadata set -- pass should not crash
+        remove_identity_slice_pass(gm)
+        self.assertEqual(self._count_slice_nodes(gm), 1)
+
+    def test_multi_dim_slice(self):
+        """Identity slice on a non-zero dimension should be removed."""
+        gm = self._build_slice_gm(
+            input_shape=(8, 16, 32), dim=2, start=0, end=32, step=1
+        )
+        remove_identity_slice_pass(gm)
+        self.assertEqual(self._count_slice_nodes(gm), 0)
+
+    def test_numerics_preserved(self):
+        """The pass should not change the numerical output of the graph."""
+        gm = self._build_slice_gm(input_shape=(4, 8), dim=0, start=0, end=4, step=1)
+
+        # Run before the pass
+        x = torch.randn(4, 8)
+        out_before = gm(x)
+
+        remove_identity_slice_pass(gm)
+
+        out_after = gm(x)
+        self.assertTrue(torch.equal(out_before, out_after))
+
+    def test_chained_identity_slices(self):
+        """Multiple chained identity slices should all be removed."""
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        s1 = graph.call_function(torch.ops.aten.slice.Tensor, args=(x, 0, 0, 8, 1))
+        s2 = graph.call_function(torch.ops.aten.slice.Tensor, args=(s1, 1, 0, 16, 1))
+        graph.output(s2)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode() as fake_mode:
+            fake_val = fake_mode.from_tensor(torch.empty(8, 16))
+        for node in gm.graph.nodes:
+            if node.op == "placeholder":
+                node.meta["val"] = fake_val
+
+        # Also annotate s1 with metadata so s2 can check its input's shape
+        for node in gm.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target is torch.ops.aten.slice.Tensor
+            ):
+                node.meta["val"] = fake_val
+                break  # Only need the first slice node (s1)
+
+        self.assertEqual(self._count_slice_nodes(gm), 2)
+        remove_identity_slice_pass(gm)
+        self.assertEqual(self._count_slice_nodes(gm), 0)
+
+
+class TestAnnotateModuleFqns(TestCase):
+    """Unit tests for annotate_module_fqns and insert_kernel_annotations_pass."""
+
+    def _trace_and_get_fqns(self, model, *args):
+        """Trace fwd+bwd with trace_train_step and return module_fqn annotations."""
+
+        def fwd_step(model, *inputs):
+            pred = model(inputs[0])
+            loss = pred.sum()
+            params = [p for p in model.parameters() if p.requires_grad]
+            grads = torch.autograd.grad(loss, params)
+            return [loss] + list(grads)
+
+        traced = trace_train_step(fwd_step)(model, *args)
+        fqns = set()
+        for node in traced.gm.graph.nodes:
+            fqn = (node.meta.get("custom") or {}).get(_MODULE_FQN)
+            if fqn:
+                fqns.add(fqn)
+        return fqns
+
+    def test_annotate_transformer_like_model(self):
+        """Module FQNs survive trace_train_step for a transformer-like model
+        with distinct submodule classes (norm, attention, ffn)."""
+
+        class Norm(torch.nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.norm = torch.nn.LayerNorm(dim)
+
+            def forward(self, x):
+                return self.norm(x)
+
+        class Attention(torch.nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.wq = torch.nn.Linear(dim, dim, bias=False)
+                self.wo = torch.nn.Linear(dim, dim, bias=False)
+
+            def forward(self, x):
+                return self.wo(torch.relu(self.wq(x)))
+
+        class FFN(torch.nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.w1 = torch.nn.Linear(dim, dim * 2, bias=False)
+                self.w2 = torch.nn.Linear(dim * 2, dim, bias=False)
+
+            def forward(self, x):
+                return self.w2(torch.relu(self.w1(x)))
+
+        class TransformerBlock(torch.nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.attention_norm = Norm(dim)
+                self.attention = Attention(dim)
+                self.ffn_norm = Norm(dim)
+                self.feed_forward = FFN(dim)
+
+            def forward(self, x):
+                h = x + self.attention(self.attention_norm(x))
+                return h + self.feed_forward(self.ffn_norm(h))
+
+        class Model(torch.nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.layer = TransformerBlock(dim)
+
+            def forward(self, x):
+                return self.layer(x)
+
+        dim = 16
+        model = Model(dim)
+        annotate_module_fqns(model)
+        fqns = self._trace_and_get_fqns(model, torch.randn(4, dim))
+
+        # Verify key module paths are present.  The Norm wrapper has no
+        # ops of its own, so its inner LayerNorm gets the deepest path.
+        self.assertIn("layer.attention_norm.norm", fqns)
+        self.assertIn("layer.attention", fqns)
+        self.assertIn("layer.attention.wq", fqns)
+        self.assertIn("layer.attention.wo", fqns)
+        self.assertIn("layer.ffn_norm.norm", fqns)
+        self.assertIn("layer.feed_forward", fqns)
+        self.assertIn("layer.feed_forward.w1", fqns)
+        self.assertIn("layer.feed_forward.w2", fqns)
+
+    def test_same_class_instances_get_distinct_fqns(self):
+        """Two parameterless instances of the same class get distinct fqns.
+
+        Uses minimal_fx_tracer directly (not trace_train_step) because
+        parameterless models cannot produce gradients via autograd.grad.
+        """
+
+        class Block(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = Block()
+                self.b = Block()
+
+            def forward(self, x):
+                return self.b(self.a(x))
+
+        model = Model()
+        annotate_module_fqns(model)
+
+        def fwd_only(state, x):
+            return model(x)
+
+        traced = minimal_fx_tracer(fwd_only)({}, torch.randn(4))
+        fqns = set()
+        for node in traced.gm.graph.nodes:
+            fqn = (node.meta.get("custom") or {}).get(_MODULE_FQN)
+            if fqn:
+                fqns.add(fqn)
+
+        self.assertIn("a", fqns)
+        self.assertIn("b", fqns)
+
+    def test_same_class_parameterless_works_with_make_fx(self):
+        """Same-class parameterless instances get distinct fqns with plain make_fx."""
+
+        class Block(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = Block()
+                self.b = Block()
+
+            def forward(self, x):
+                return self.b(self.a(x))
+
+        model = Model()
+        annotate_module_fqns(model)
+
+        with preserve_node_meta():
+            gm = make_fx(model)(torch.randn(4))
+
+        fqns = set()
+        for node in gm.graph.nodes:
+            fqn = (node.meta.get("custom") or {}).get(_MODULE_FQN)
+            if fqn:
+                fqns.add(fqn)
+
+        self.assertIn("a", fqns)
+        self.assertIn("b", fqns)
+
+    def test_same_class_instances_with_params_get_distinct_fqns(self):
+        """Two instances of the same class with parameters get distinct fqns."""
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(4, 4)
+                self.b = torch.nn.Linear(4, 4)
+
+            def forward(self, x):
+                return self.b(self.a(x))
+
+        model = Model()
+        annotate_module_fqns(model)
+        fqns = self._trace_and_get_fqns(model, torch.randn(2, 4))
+
+        self.assertIn("a", fqns)
+        self.assertIn("b", fqns)
+
+    def _build_annotated_gm(self):
+        """Build a GraphModule with module_fqn annotations on its nodes."""
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        n1 = graph.call_function(torch.relu, (x,))
+        n1.meta["custom"] = {_MODULE_FQN: "attn"}
+        n2 = graph.call_function(torch.sigmoid, (n1,))
+        n2.meta["custom"] = {_MODULE_FQN: "attn"}
+        n3 = graph.call_function(torch.tanh, (n2,))
+        n3.meta["custom"] = {_MODULE_FQN: "ffn"}
+        graph.output(n3)
+        return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    def test_insert_kernel_annotations_pass_inserts_calls(self):
+        """When tools ID is available, the pass inserts enter/exit calls."""
+        if _is_tools_id_unavailable():
+            self.skipTest("cudaGraphNodeGetToolsId not available")
+
+        gm = self._build_annotated_gm()
+        num_before = sum(1 for n in gm.graph.nodes if n.op == "call_function")
+
+        insert_kernel_annotations_pass(gm)
+
+        num_after = sum(1 for n in gm.graph.nodes if n.op == "call_function")
+        # 2 scopes (attn, ffn) = 2 enters + 2 exits = 4 new nodes
+        self.assertEqual(num_after - num_before, 4)
+
+    def test_insert_kernel_annotations_pass_noop_when_unavailable(self):
+        """When tools ID is unavailable, the pass leaves the graph unchanged."""
+        gm = self._build_annotated_gm()
+        num_before = len(list(gm.graph.nodes))
+
+        with patch(
+            "torch.cuda._graph_annotations._is_tools_id_unavailable",
+            return_value=True,
+        ):
+            insert_kernel_annotations_pass(gm)
+
+        num_after = len(list(gm.graph.nodes))
+        self.assertEqual(num_before, num_after)
+
+    def test_insert_kernel_annotations_pass_noop_without_metadata(self):
+        """The pass should not insert anything when no custom metadata exists."""
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        n1 = graph.call_function(torch.relu, (x,))
+        graph.output(n1)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        num_before = len(list(gm.graph.nodes))
+        insert_kernel_annotations_pass(gm)
+        num_after = len(list(gm.graph.nodes))
+
+        self.assertEqual(num_before, num_after)
 
 
 if __name__ == "__main__":

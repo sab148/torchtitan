@@ -9,8 +9,6 @@
 
 import torch
 import torch.nn as nn
-from torch.distributed._composable.fsdp import FSDPModule
-from torch.distributed._composable.replicate_with_fsdp import replicate
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import Replicate, Shard
@@ -32,10 +30,14 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
-from torchtitan.distributed.compile import apply_compile_dense
+from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
-from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
+from torchtitan.distributed.fsdp import (
+    disable_fsdp_gradient_division,
+    get_fsdp_reshard_after_forward_policy,
+)
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
+from torchtitan.models.common.attention import FusedQKVLinear
 from torchtitan.models.llama3.model import Llama3Model
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
@@ -59,9 +61,6 @@ def parallelize_llama(
     NOTE: The passed-in model preferably should be on meta device. Otherwise,
     the model must fit on GPU or CPU memory.
     """
-    # TODO: TP currently cannot handle uneven seq_len because we set
-    #       `use_local_output=True` to use plain Tensors for legacy reasons.
-    #       Need to revisit this.
     assert (
         training.seq_len % parallel_dims.seq_len_divisor == 0
     ), f"""
@@ -116,38 +115,24 @@ def parallelize_llama(
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if model_compile_enabled:
-        apply_compile_dense(model, compile_config)
+        apply_compile(model, compile_config)
 
-    if parallel_dims.fsdp_enabled:
-        # dp_mesh is the mesh for FSDP/HSDP
-        names = (
-            ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        )
-        dp_mesh = parallel_dims.get_mesh(names)
-        apply_fsdp(
-            model,
-            dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-            pp_enabled=parallel_dims.pp_enabled,
-            cpu_offload=training.enable_cpu_offload,
-            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        )
+    names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
+    dp_mesh = parallel_dims.get_mesh(names)
+    apply_fsdp(
+        model,
+        dp_mesh,
+        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        pp_enabled=parallel_dims.pp_enabled,
+        cpu_offload=training.enable_cpu_offload,
+        reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+    )
 
-        if parallel_dims.dp_replicate_enabled:
-            logger.info("Applied HSDP to the model")
-        else:
-            logger.info("Applied FSDP to the model")
+    logger.info("Applied fully_shard to the model")
 
-        if training.enable_cpu_offload:
-            logger.info("Applied CPU Offloading to the model")
-    elif parallel_dims.dp_replicate_enabled:
-        apply_replicate(
-            model,
-            parallel_dims.get_mesh("dp_replicate"),
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        )
+    if training.enable_cpu_offload:
+        logger.info("Applied CPU Offloading to the model")
 
     return model
 
@@ -169,7 +154,7 @@ def apply_tp(
     embed_plan = RowwiseParallel(
         input_layouts=Replicate(),
         output_layouts=sp_layout,
-        use_local_output=enable_sp,
+        use_local_output=False,
     )
 
     parallelize_module(
@@ -177,7 +162,9 @@ def apply_tp(
         tp_mesh,
         {
             "tok_embeddings": embed_plan,
-            "norm": SequenceParallel() if enable_sp else NoParallel(),
+            "norm": SequenceParallel(use_local_output=False)
+            if enable_sp
+            else NoParallel(),
             "output": ColwiseParallel(
                 input_layouts=sp_layout,
                 output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
@@ -212,39 +199,53 @@ def apply_tp(
     # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
     #       by folding (and unfolding) the batch dimension and the sequence dimension.
     #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
-    norm_plan = SequenceParallel() if enable_sp else NoParallel()
+    norm_plan = SequenceParallel(use_local_output=False) if enable_sp else NoParallel()
     rowwise_output_plan = rowwise_parallel(
-        output_layouts=sp_layout, use_local_output=enable_sp
+        output_layouts=sp_layout, use_local_output=False
+    )
+
+    # Detect whether fused QKV is used by checking the first layer
+    # pyrefly: ignore [not-callable]
+    first_block = next(iter(model.layers.values()))
+    use_fused_qkv = isinstance(
+        first_block.attention.qkv_linear,  # pyrefly: ignore [missing-attribute]
+        FusedQKVLinear,
     )
 
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
-        # pyrefly: ignore [no-matching-overload]
+        if use_fused_qkv:
+            qkv_plan = {
+                "attention.qkv_linear.wqkv": colwise_parallel(use_local_output=False),
+            }
+        else:
+            qkv_plan = {
+                "attention.qkv_linear.wq": colwise_parallel(use_local_output=False),
+                "attention.qkv_linear.wk": colwise_parallel(use_local_output=False),
+                "attention.qkv_linear.wv": colwise_parallel(use_local_output=False),
+            }
         layer_plan = {
             "attention_norm": norm_plan,
             "attention": prepare_module_input(
-                input_layouts=(sp_layout, None, None, None),
-                desired_input_layouts=(Replicate(), None, None, None),
+                input_layouts=(sp_layout, Replicate(), None, None),
+                desired_input_layouts=(Replicate(), Replicate(), None, None),
             ),
-            "attention.wq": colwise_parallel(),
-            "attention.wk": colwise_parallel(),
-            "attention.wv": colwise_parallel(),
+            **qkv_plan,
             "attention.wo": rowwise_output_plan,
             "ffn_norm": norm_plan,
             "feed_forward": prepare_module_input(
                 input_layouts=(sp_layout,),
                 desired_input_layouts=(Replicate(),),
             ),
-            "feed_forward.w1": colwise_parallel(),
+            "feed_forward.w1": colwise_parallel(use_local_output=False),
             "feed_forward.w2": rowwise_output_plan,
-            "feed_forward.w3": colwise_parallel(),
+            "feed_forward.w3": colwise_parallel(use_local_output=False),
         }
 
         parallelize_module(
             # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
-            # pyrefly: ignore [bad-argument-type]
             parallelize_plan=layer_plan,
         )
 
@@ -252,23 +253,6 @@ def apply_tp(
         f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}"
         "Tensor Parallelism to the model"
     )
-
-
-def disable_fsdp_gradient_division(model: nn.Module) -> None:
-    """
-    Disable FSDP's automatic gradient division for all FSDP modules.
-
-    Set gradient_divide_factor=1.0 to disable FSDP's automatic gradient division.
-    We handle gradient scaling ourselves in the training loop with global token count.
-
-    Note: This also works for ReplicateModule since it inherits from FSDPModule.
-
-    Args:
-        model: The model containing FSDP-wrapped or Replicate-wrapped modules
-    """
-    for module in model.modules():
-        if isinstance(module, FSDPModule):
-            module.set_gradient_divide_factor(1.0)
 
 
 def apply_fsdp(
@@ -297,7 +281,11 @@ def apply_fsdp(
             - "never" will disable `reshard_after_forward` for all forward passes.
 
     """
-    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        cast_forward_inputs=False,
+    )
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if cpu_offload:
         # pyrefly: ignore[bad-typed-dict-key]
@@ -348,41 +336,3 @@ def apply_fsdp(
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)
-
-
-def apply_replicate(
-    model: nn.Module,
-    dp_mesh: DeviceMesh,
-    param_dtype: torch.dtype,
-    reduce_dtype: torch.dtype,
-):
-    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-    replicate_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
-
-    if model.tok_embeddings is not None:
-        # pyrefly: ignore [no-matching-overload, invalid-param-spec]
-        replicate(
-            model.tok_embeddings,
-            **replicate_config,
-        )
-    # pyrefly: ignore [missing-attribute]
-    for layer_id, transformer_block in model.layers.items():
-        # pyrefly: ignore [invalid-param-spec]
-        replicate(
-            transformer_block,
-            **replicate_config,
-        )
-
-    if model.norm is not None and model.output is not None:
-        # pyrefly: ignore [no-matching-overload, invalid-param-spec]
-        replicate(
-            [model.norm, model.output],
-            **replicate_config,
-        )
-    # pyrefly: ignore [invalid-param-spec]
-    replicate(model, **replicate_config)
-
-    # Disable Replicate's automatic gradient division (ReplicateModule inherits from FSDPModule)
-    disable_fsdp_gradient_division(model)
-
-    logger.info("Applied replicate to the model")

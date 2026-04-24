@@ -22,10 +22,18 @@ import torch
 import torch.utils._pytree as pytree
 from torch._dynamo.aot_compile_types import BundledAOTAutogradSerializableCallable
 
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    SubclassLayout,
+    TracedResult,
+)
 from torchtitan.experiments.graph_trainer.storage import StorageAdapter
 from torchtitan.tools.logging import logger
 
 ConfigFingerprint = NewType("ConfigFingerprint", str)
+
+# Single artifact key — there is exactly one compiled artifact per
+# precompile_artifact_dir, so no key-based dispatch is needed.
+_ARTIFACT_KEY = "default"
 
 
 @dataclass
@@ -79,6 +87,22 @@ def compute_config_fingerprint(
     return ConfigFingerprint(h.hexdigest()[:16])
 
 
+def _register_coor_ops() -> None:
+    """Register CooR custom ops required for deserialization.
+
+    CooR-compiled artifacts reference custom ops (e.g.
+    device_mesh._runtime_compute_coordinate_on_dim) that are lazily
+    registered. The ops module uses @torch.library.custom_op with
+    DeviceMesh, which requires DeviceMesh to be registered as an
+    opaque type first. Must be called before deserializing any
+    CooR-compiled artifact.
+    """
+    from torch.distributed.device_mesh import _register_distributed_opaque_types
+
+    _register_distributed_opaque_types()
+    from torch.distributed._ops import device_mesh as _dm_ops  # noqa: F401
+
+
 def _unwrap_serializable(
     compiled_fn: Any,
 ) -> BundledAOTAutogradSerializableCallable:
@@ -106,7 +130,6 @@ def precompile_save(
     model: torch.nn.Module,
     compiled_fn: BundledAOTAutogradSerializableCallable,
     storage: StorageAdapter,
-    artifact_key: str,
     out_spec: pytree.TreeSpec | None,
     metadata: dict[str, Any] | None = None,
     config_fingerprint: ConfigFingerprint | None = None,
@@ -117,6 +140,7 @@ def precompile_save(
     Returns the path/URI of the saved artifact.
     """
     compiled_fn = _unwrap_serializable(compiled_fn)
+
     serialized_fn = BundledAOTAutogradSerializableCallable.serialize_compile_artifacts(
         compiled_fn
     )
@@ -134,9 +158,9 @@ def precompile_save(
     )
 
     data = pickle.dumps(artifact)
-    path = storage.save(artifact_key, data)
+    path = storage.save(_ARTIFACT_KEY, data)
     logger.info(
-        f"Precompile artifact saved: key={artifact_key}, "
+        f"Precompile artifact saved: "
         f"params={len(params_spec)}, buffers={len(buffers_spec)}, "
         f"size={len(data)} bytes, fingerprint={config_fingerprint}, "
         f"path={path}"
@@ -147,7 +171,6 @@ def precompile_save(
 def precompile_load(
     model: torch.nn.Module,
     storage: StorageAdapter,
-    artifact_key: str,
     expected_fingerprint: ConfigFingerprint,
 ) -> Callable:
     """
@@ -155,7 +178,7 @@ def precompile_load(
     binds model parameters/buffers (same calling convention as
     joint_graph_builder's wrapper_fn).
     """
-    data = storage.load(artifact_key)
+    data = storage.load(_ARTIFACT_KEY)
     # SAFETY: pickle.loads executes arbitrary code during deserialization.
     # This is acceptable here because storage backends are assumed to be
     # trusted (local disk or controlled shared filesystem).
@@ -174,35 +197,10 @@ def precompile_load(
             f"Saved: {artifact.buffers_spec}, Current: {current_buffers}"
         )
 
-    skip_fp_check = os.environ.get("TORCHTITAN_SKIP_FINGERPRINT_CHECK", "") == "1"
-    if expected_fingerprint and artifact.config_fingerprint:
-        if artifact.config_fingerprint != expected_fingerprint:
-            if skip_fp_check:
-                logger.warning(
-                    "Config fingerprint mismatch IGNORED due to "
-                    "TORCHTITAN_SKIP_FINGERPRINT_CHECK=1. "
-                    f"Artifact: {artifact.config_fingerprint}, "
-                    f"current: {expected_fingerprint}."
-                )
-            else:
-                raise ValueError(
-                    f"Config fingerprint mismatch: the precompiled artifact was "
-                    f"saved with a different model/parallelism/compile configuration. "
-                    f"Artifact fingerprint: {artifact.config_fingerprint}, "
-                    f"current fingerprint: {expected_fingerprint}. "
-                    f"Delete the stale artifact and re-run with precompile to "
-                    f"generate a fresh one. Set TORCHTITAN_SKIP_FINGERPRINT_CHECK=1 "
-                    f"to bypass this check."
-                )
-    elif expected_fingerprint and not artifact.config_fingerprint:
-        logger.warning(
-            "Precompiled artifact has no config fingerprint (legacy artifact). "
-            "Skipping fingerprint validation. Re-save the artifact to enable "
-            "fingerprint checks."
-        )
+    _validate_config_fingerprint(artifact.config_fingerprint, expected_fingerprint)
 
     logger.info(
-        f"Precompile artifact loaded: key={artifact_key}, "
+        f"Precompile artifact loaded: "
         f"params={len(artifact.params_spec)}, "
         f"buffers={len(artifact.buffers_spec)}, "
         f"fingerprint={artifact.config_fingerprint}, "
@@ -223,6 +221,9 @@ def precompile_load(
             logger.info(
                 f"Deserializing compiled fn on device {torch.cuda.current_device()}"
             )
+
+            _register_coor_ops()
+
             compiled_fn = (
                 BundledAOTAutogradSerializableCallable.deserialize_compile_artifacts(
                     serialized_fn_bytes
@@ -248,3 +249,200 @@ def precompile_load(
         return flat_outputs
 
     return wrapper_fn
+
+
+def _validate_config_fingerprint(
+    artifact_fingerprint: ConfigFingerprint,
+    expected_fingerprint: ConfigFingerprint,
+) -> None:
+    """Validate that artifact and current config fingerprints match.
+
+    Raises ValueError on mismatch unless TORCHTITAN_SKIP_FINGERPRINT_CHECK=1
+    is set in the environment, in which case a warning is emitted instead.
+    No-ops when either fingerprint is empty (legacy artifact / missing config).
+    """
+    if not expected_fingerprint or not artifact_fingerprint:
+        if expected_fingerprint and not artifact_fingerprint:
+            logger.warning(
+                "Precompiled artifact has no config fingerprint (legacy artifact). "
+                "Skipping fingerprint validation. Re-save the artifact to enable "
+                "fingerprint checks."
+            )
+        return
+
+    if artifact_fingerprint == expected_fingerprint:
+        return
+
+    if os.environ.get("TORCHTITAN_SKIP_FINGERPRINT_CHECK", "") == "1":
+        logger.warning(
+            "Config fingerprint mismatch IGNORED due to "
+            "TORCHTITAN_SKIP_FINGERPRINT_CHECK=1. "
+            f"Artifact: {artifact_fingerprint}, "
+            f"current: {expected_fingerprint}."
+        )
+        return
+
+    raise ValueError(
+        f"Config fingerprint mismatch: the precompiled artifact was "
+        f"saved with a different configuration. "
+        f"Artifact fingerprint: {artifact_fingerprint}, "
+        f"current fingerprint: {expected_fingerprint}. "
+        f"Delete the stale artifact and re-run precompile to "
+        f"generate a fresh one. Set TORCHTITAN_SKIP_FINGERPRINT_CHECK=1 "
+        f"to bypass this check."
+    )
+
+
+_FX_TRACE_ARTIFACT_KEY = "fx_trace_default"
+
+
+@dataclass
+class PrecompiledFxTraceArtifact:
+    """Serialized form of a TracedResult for aot_fx_trace precompilation.
+
+    Stores the traced FX graph (as a GraphPickler-serialized
+    GraphModule) alongside the TracedResult metadata needed to unwrap
+    DTensor inputs and rewrap outputs at runtime. Compiled Triton
+    kernels (AOTCompiledArtifact nodes from regional_inductor) are
+    baked into the serialized graph at precompile time — no Inductor
+    recompilation is needed at load time.
+    """
+
+    serialized_gm: bytes
+    state_fqns: list[str]
+    num_flat_inputs: int
+    input_subclass_layouts: dict[int, SubclassLayout]
+    num_flat_outputs: int
+    output_subclass_layouts: dict[int, SubclassLayout]
+    output_spec: pytree.TreeSpec
+    tensor_input_indices: list[int]
+    config_fingerprint: ConfigFingerprint = ConfigFingerprint("")
+
+    @classmethod
+    def from_traced_result(
+        cls,
+        traced_result: TracedResult,
+        config_fingerprint: ConfigFingerprint | None = None,
+    ) -> "PrecompiledFxTraceArtifact":
+        """Create an artifact from a TracedResult by serializing its GraphModule.
+
+        Uses GraphPickler (not plain pickle) to preserve SymInt
+        expressions in the graph. Plain pickle evaluates SymInts to
+        concrete trace-time values, baking in rank-specific constants
+        (e.g. the embedding vocab offset from
+        _runtime_compute_coordinate_on_dim).
+        """
+        from torch.fx._graph_pickler import GraphPickler, Options
+
+        from torchtitan.experiments.graph_trainer.passes import (
+            _node_metadata_key_filter_distributed,
+        )
+
+        serialized_gm = GraphPickler.dumps(
+            traced_result.gm,
+            Options(
+                ops_filter=None,
+                node_metadata_key_filter=_node_metadata_key_filter_distributed,
+            ),
+        )
+
+        return cls(
+            serialized_gm=serialized_gm,
+            state_fqns=traced_result.state_fqns,
+            num_flat_inputs=traced_result.num_flat_inputs,
+            input_subclass_layouts=traced_result.input_subclass_layouts,
+            num_flat_outputs=traced_result.num_flat_outputs,
+            output_subclass_layouts=traced_result.output_subclass_layouts,
+            output_spec=traced_result.output_spec,
+            tensor_input_indices=traced_result.tensor_input_indices,
+            config_fingerprint=config_fingerprint or ConfigFingerprint(""),
+        )
+
+    def to_traced_result(self) -> TracedResult:
+        """Deserialize back into a TracedResult.
+
+        Registers CooR custom ops, then deserializes the GraphModule
+        via GraphPickler under a FakeTensorMode (needed so that
+        placeholder metadata contains FakeTensors for downstream
+        passes like regional_inductor).
+        """
+        _register_coor_ops()
+
+        from torch._subclasses import FakeTensorMode
+        from torch.fx._graph_pickler import GraphPickler
+
+        fake_mode = FakeTensorMode(
+            allow_non_fake_inputs=True,
+            shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
+        )
+        gm = GraphPickler.loads(self.serialized_gm, fake_mode)
+        gm.recompile()
+
+        return TracedResult(
+            gm=gm,
+            example_inputs=(),
+            state_fqns=self.state_fqns,
+            num_flat_inputs=self.num_flat_inputs,
+            input_subclass_layouts=self.input_subclass_layouts,
+            num_flat_outputs=self.num_flat_outputs,
+            output_subclass_layouts=self.output_subclass_layouts,
+            output_spec=self.output_spec,
+            tensor_input_indices=self.tensor_input_indices,
+        )
+
+
+def precompile_fx_trace_save(
+    traced_result: TracedResult,
+    storage: StorageAdapter,
+    config_fingerprint: ConfigFingerprint | None = None,
+) -> str:
+    """Serialize a traced and compiled FX graph artifact and save it.
+
+    The GraphModule should have graph passes (cleanup, annotation,
+    regional_inductor) already applied so compiled Triton kernels are
+    baked into the artifact as AOTCompiledArtifact nodes.
+    """
+    artifact = PrecompiledFxTraceArtifact.from_traced_result(
+        traced_result, config_fingerprint
+    )
+
+    data = pickle.dumps(artifact)
+    path = storage.save(_FX_TRACE_ARTIFACT_KEY, data)
+    logger.info(
+        f"FxTrace precompile artifact saved: "
+        f"state_fqns={len(artifact.state_fqns)}, "
+        f"num_flat_inputs={artifact.num_flat_inputs}, "
+        f"size={len(data)} bytes, fingerprint={config_fingerprint}, "
+        f"path={path}"
+    )
+    return path
+
+
+def precompile_fx_trace_load(
+    storage: StorageAdapter,
+    expected_fingerprint: ConfigFingerprint,
+) -> TracedResult:
+    """Load a precompiled aot_fx_trace artifact.
+
+    Returns a TracedResult with the deserialized GraphModule and
+    metadata. The caller uses this with run_traced_train_step to
+    execute the graph (same path as non-precompiled aot_fx_trace).
+
+    DeviceMesh objects are graph inputs (placeholders), not baked-in
+    constants, so ProcessGroup names are resolved at runtime from
+    the caller-provided DeviceMesh — no post-deserialization PG
+    remapping is needed.
+    """
+    data = storage.load(_FX_TRACE_ARTIFACT_KEY)
+    artifact: PrecompiledFxTraceArtifact = pickle.loads(data)
+
+    _validate_config_fingerprint(artifact.config_fingerprint, expected_fingerprint)
+
+    logger.info(
+        f"FxTrace precompile artifact loaded: "
+        f"state_fqns={len(artifact.state_fqns)}, "
+        f"num_flat_inputs={artifact.num_flat_inputs}, "
+        f"fingerprint={artifact.config_fingerprint}"
+    )
+
+    return artifact.to_traced_result()

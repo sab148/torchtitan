@@ -201,8 +201,7 @@ class RoPE(Module):
         """Return the precomputed cache tensor (slicing is done by apply_rotary_emb)."""
         return self.cache
 
-    def init_weights(self, **kwargs) -> None:
-        buffer_device = kwargs.get("buffer_device")
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         if buffer_device is not None:
             with torch.device(buffer_device):
                 self.cache = self._precompute()
@@ -382,12 +381,14 @@ def apply_rotary_emb_cos_sin(
     Args:
         xq: (bsz, seqlen, n_heads, head_dim)
         xk: (bsz, seqlen, n_kv_heads, head_dim)
-        rope_cache: (max_seqlen, head_dim * 2) with cos and sin concatenated
+        rope_cache: (max_seqlen, head_dim * 2) with cos and sin concatenated,
+            or (bsz, seqlen, 1, head_dim * 2) if already broadcast-shaped (MRoPE)
         positions: optional position indices
     """
     positions = _maybe_wrap_positions(positions, xq)
     head_dim = xq.shape[-1]
-    rope_cache = _reshape_for_broadcast_cos_sin(rope_cache, xq, positions)
+    if rope_cache.ndim != 4:
+        rope_cache = _reshape_for_broadcast_cos_sin(rope_cache, xq, positions)
     cos = rope_cache[..., :head_dim].to(device=xq.device)
     sin = rope_cache[..., head_dim:].to(device=xq.device)
     xq_f = xq.float()

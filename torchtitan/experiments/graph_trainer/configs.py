@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Callable
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Literal
 
 from torchtitan.config import ActivationCheckpointConfig
@@ -37,43 +37,62 @@ class GraphTrainerCompileConfig(CompileConfig):
     """Joint graph pass names to apply on the joint forward-backward
     graph before partitioning. Only used in AOT mode."""
 
-    precompile: bool = False
+    enable_passes: bool = True
+    """When False, skip all graph passes (both default and user-configured)."""
+
+    debug_graph_passes: bool = False
+    """Log timing, op-count diffs, and before/after graphs for each pass to tlparse."""
+
+    memory_policy: Literal["default", "eager"] = "default"
     """
-    Enable serializable compilation. On first run, compiles with
-    serializable=True and saves the artifact. On subsequent runs, detects
-    the existing artifact and loads it, skipping compilation entirely.
+    Memory optimization policy for activation management (SAC, offload).
+        default: save all compute-intensive ops and FSDP all_gathers.
+        eager: alternate mm ops between save/recompute, matching the eager
+            AC policy in torchtitan.distributed.activation_checkpoint.
     """
 
-    precompile_artifact_dir: str = "/tmp/precompile_artifacts"
-    """
-    Directory where precompile artifacts are stored. The default /tmp
-    is ephemeral on most cluster environments. For multi-node setups
-    or persistence across job restarts, set this to a shared filesystem
-    path (e.g. under the job output directory).
-    """
+    enable_cudagraph: bool = True
+    """When False, skip the cudagraph pass even if the graph is compatible."""
 
-
-@dataclass(kw_only=True, slots=True)
-class GraphTrainerConfig(Trainer.Config):
-    compile: GraphTrainerCompileConfig = field(
-        default_factory=GraphTrainerCompileConfig
-    )
+    precompile_artifact_dir: str = ""
+    """
+    Directory for precompiled artifacts. Setting this enables precompile:
+    precompile_main.py saves the artifact here, and training loads it from
+    here to skip compilation. For multi-node setups use a shared filesystem
+    path.
+    """
 
 
 def to_graph_trainer_config(
     base_config: Trainer.Config,
     model_registry: Callable[[str], ModelSpec],
-) -> GraphTrainerConfig:
-    """Convert a base Trainer.Config to a GraphTrainerConfig.
+) -> "GraphTrainer.Config":
+    """Convert a base Trainer.Config to a GraphTrainer.Config.
 
     Copies all fields from the base config and replaces the model_spec with one
     from the graph_trainer model_registry. The compile field is removed and
-    left as the GraphTrainerConfig default; callers should explicitly set it.
+    left as the GraphTrainer.Config default; callers should explicitly set it.
     """
+    from .cudagraph import cudagraph_annotate_trace_post_processor
     from .trainer import GraphTrainer
 
     d = {f.name: getattr(base_config, f.name) for f in fields(base_config)}
-    d["model_spec"] = model_registry(base_config.model_spec.flavor)
+    graph_spec = model_registry(base_config.model_spec.flavor)
+    # Wrap the base model config in the graph_trainer's model config class
+    # (e.g. GraphTrainerQwen3Model.Config) while preserving all field values
+    # (including moe_comm_backend etc.).
+    graph_model_cls = type(graph_spec.model)
+    graph_model = graph_model_cls(
+        **{
+            f.name: getattr(base_config.model_spec.model, f.name)
+            for f in fields(base_config.model_spec.model)
+        }
+    )
+    d["model_spec"] = replace(
+        base_config.model_spec,
+        parallelize_fn=graph_spec.parallelize_fn,
+        model=graph_model,
+    )
     d.pop("compile")
 
     # graph_trainer uses graph-based SAC instead of eager AC. Override any
@@ -81,5 +100,12 @@ def to_graph_trainer_config(
     ac = d.get("activation_checkpoint")
     if ac is not None and ac.mode != "none":
         d["activation_checkpoint"] = ActivationCheckpointConfig(mode="selective")
+
+    # Merge CUDA graph kernel annotations into profiler traces when profiling
+    # is active.  No-op otherwise (and no-op when requirements aren't met).
+    # It's also a no-op if there is CUDA graph is not enabled.
+    profiler = d.get("profiler")
+    if profiler is not None:
+        profiler.trace_post_processor = cudagraph_annotate_trace_post_processor()
 
     return GraphTrainer.Config(**d)

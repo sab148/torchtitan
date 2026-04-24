@@ -4,34 +4,55 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate
 from torch.fx.traceback import annotate_fn
-from torch.utils._pytree import register_pytree_node, tree_map
+from torch.utils._pytree import register_constant, register_pytree_node, tree_map
 
 from torchtitan.config import CompileConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
-_AC_REGION_ID = "ac_region_id"
+_MODULE_FQN = "module_fqn"
+_NOT_IN_LAYERS = -1
 
 
-def annotate_ac_regions(model: nn.Module) -> None:
-    """Annotate each transformer block with a unique AC region ID.
+def _is_backward_node(node: torch.fx.Node) -> bool:
+    return node.meta.get("autograd_backward", False)
 
-    This enables apply_sac_pass to assign different ac_graph_id values
-    per block, creating AC region boundaries between transformer blocks.
+
+def _get_layer_id(node: torch.fx.Node) -> int:
+    """Extract the layer index from the node's module_fqn metadata.
+
+    Nodes under ``layers.<N>`` return ``N``.
+    All other nodes (tok_embeddings, norm, output) return ``_NOT_IN_LAYERS``.
     """
-    layers = model.get_submodule("layers")
-    for layer_id, transformer_block in layers.named_children():
-        transformer_block.forward = annotate_fn({_AC_REGION_ID: int(layer_id)})(
-            transformer_block.forward
-        )
+    fqn = node.meta.get("custom", {}).get(_MODULE_FQN, "")
+    parts = fqn.split(".")
+    if parts[0] == "layers" and len(parts) >= 2:
+        try:
+            return int(parts[1])
+        except ValueError:
+            pass
+    return _NOT_IN_LAYERS
+
+
+def annotate_module_fqns(model: nn.Module) -> None:
+    """Annotate all modules' forward with their fully-qualified names.
+
+    Every named submodule (excluding the root) gets its forward method wrapped
+    with ``annotate_fn`` so that FX nodes carry ``module_fqn`` in
+    ``node.meta["custom"]``.
+
+    Call once after model construction, before tracing/compilation.
+    """
+    for fqn, submodule in model.named_modules():
+        if fqn:  # skip root module
+            submodule.forward = annotate_fn({_MODULE_FQN: fqn})(submodule.forward)
 
 
 def parallelize_inputs(parallel_dims, args, kwargs):
@@ -68,6 +89,16 @@ def register_blockmask_pytree_node():
             flatten_with_keys_fn=BlockMask._flatten_with_keys,
             serialized_type_name="torch.nn.attention.flex_attention.BlockMask",
         )
+
+
+def maybe_register_blockmask_pytree_node() -> None:
+    """Register flex-attention pytree helpers if they are missing."""
+    from torch.nn.attention.flex_attention import _MaskModWrapper, BlockMask
+
+    if BlockMask not in torch.utils._pytree.SUPPORTED_NODES:
+        register_blockmask_pytree_node()
+    if _MaskModWrapper not in torch.utils._pytree.SUPPORTED_NODES:
+        register_constant(_MaskModWrapper)
 
 
 def end_with_pass(passes: list[Callable], names: list[str]) -> bool:
@@ -115,6 +146,21 @@ def get_extra_fsdp_pg_name(original_pg_name: str) -> str | None:
     return _EXTRA_FSDP_PG_REGISTRY.get(original_pg_name)
 
 
+def get_default_transformer_block_buckets(
+    n_layers: int,
+) -> list[list[str] | str]:
+    """Get default transformer block buckets for manual bucketing passes.
+
+    Assumes the standard Decoder layout: tok_embeddings, layers.0..N-1,
+    norm, and output (e.g., Llama3, DeepSeekV3, Qwen3).
+    """
+    return [
+        "tok_embeddings",
+        *[f"layers.{i}" for i in range(n_layers)],
+        ["norm", "output"],
+    ]
+
+
 def get_transformer_block_buckets(model) -> list[list[str] | str]:
     """Get transformer block buckets for manual bucketing passes.
 
@@ -146,25 +192,6 @@ def get_transformer_block_buckets(model) -> list[list[str] | str]:
     return module_fqns
 
 
-@contextmanager
-def annotate_flex_attention_for_regional_inductor() -> Generator[None, None, None]:
-    """Annotate FlexAttention.forward so regional_inductor compiles flex attention HOPs.
-
-    Uses the same inductor configs as FlexAttention._compiled_flex_attn
-    to ensure bitwise-identical kernels between eager and regional_inductor paths.
-    """
-    from torchtitan.models.common.attention import FlexAttention
-
-    orig = FlexAttention.forward
-    FlexAttention.forward = annotate_fn(
-        {"compile_with_inductor": {"inductor_configs": FlexAttention.inductor_configs}}
-    )(orig)
-    try:
-        yield
-    finally:
-        FlexAttention.forward = orig
-
-
 def apply_graph_ac(
     compile_config: CompileConfig,
     ac_config: "ActivationCheckpointConfig",
@@ -177,7 +204,7 @@ def apply_graph_ac(
     if ac_config.mode != "selective":
         raise ValueError(
             f"graph_trainer only supports activation_checkpoint.mode 'selective' or "
-            f"'none', got '{ac_config.mode}'. Use 'selective' for graph-based SAC."
+            f"'none', got {ac_config.mode!r}. Use 'selective' for graph-based SAC."
         )
 
     joint_pass_names = getattr(compile_config, "joint_passes", [])
