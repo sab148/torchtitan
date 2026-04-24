@@ -7,7 +7,7 @@
 from dataclasses import dataclass
 
 import torch
-from torch import nn
+import torch.nn as nn
 from torch.nn.attention.flex_attention import and_masks
 
 from torchtitan.components.tokenizer import BaseTokenizer
@@ -16,16 +16,19 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     create_attention_mask,
     create_varlen_metadata_for_document,
+    FlexAttention,
     get_causal_mask_mod,
     get_document_mask_mod,
+    VarlenAttention,
 )
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe.moe import MoE
+from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.common.utils import trunc_normal_
 from torchtitan.protocols.model import BaseModel
-from torchtitan.protocols.module import Module
+from torchtitan.protocols.module import Module, ModuleDict
 
 __all__ = ["Decoder", "TransformerBlock"]
 
@@ -48,10 +51,11 @@ class TransformerBlock(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        norm_eps: float = 1e-5
         attention: BaseAttention.Config  # required, no default
         feed_forward: FeedForward.Config | None = None
         moe: MoE.Config | None = None
+        attention_norm: RMSNorm.Config
+        ffn_norm: RMSNorm.Config
 
 
 class Decoder(BaseModel):
@@ -66,8 +70,9 @@ class Decoder(BaseModel):
         dim: int
         n_layers: int
         vocab_size: int
-        norm_eps: float = 1e-5
+        output: Linear.Config
         tok_embeddings: Embedding.Config
+        norm: RMSNorm.Config
         # TODO: Right now RoPE config is not in each TransformerBlock / Attention,
         # so that rope cache, a.k.a. freqs_cis, is shared by all layers. However,
         # it causes redundantly passing backend (complex / cos_sin) to both RoPE
@@ -87,14 +92,16 @@ class Decoder(BaseModel):
         self.rope = config.rope.build()
         self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
 
-        self.layers = torch.nn.ModuleDict()
+        self.layers = ModuleDict()
         for layer_id in range(config.n_layers):
             self.layers[str(layer_id)] = config.layer.build(
                 layer_id=layer_id, dim=config.dim, n_layers=config.n_layers
             )
 
-        self.norm = nn.RMSNorm(config.dim, eps=config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+        self.norm = config.norm.build(normalized_shape=config.dim)
+        self.output = config.output.build(
+            in_features=config.dim, out_features=config.vocab_size
+        )
 
     def init_weights(
         self,
@@ -116,11 +123,16 @@ class Decoder(BaseModel):
             # pyrefly: ignore [not-callable]
             layer.init_weights(buffer_device=buffer_device)
         if self.norm is not None:
-            self.norm.reset_parameters()
+            self.norm.init_weights()
+
+        # TODO: this init_weights logic can be the same as others
+        # if we move final_out_std and cutoff_factor logic to
+        # decoder.__init__(). Refactor this logic when we refactor
+        # init_weights.
         final_out_std = self.config.dim**-0.5
         cutoff_factor = 3
         if self.output is not None:
-            trunc_normal_(
+            nn.init.trunc_normal_(
                 self.output.weight,
                 mean=0.0,
                 std=final_out_std,
@@ -152,7 +164,7 @@ class Decoder(BaseModel):
     ) -> AttentionMasksType:
         mask_mods = [get_causal_mask_mod()]
 
-        match self.attn_config.attn_mask_type:
+        match self.attn_config.mask_type:
             case "causal":
                 B = 1
             case "block_causal":
@@ -161,11 +173,17 @@ class Decoder(BaseModel):
                 mask_mods.append(get_document_mask_mod(input_batch, tokenizer.eos_id))
             case _:
                 raise ValueError(
-                    f"Unknown attention mask type: {self.attn_config.attn_mask_type}"
+                    f"Unknown attention mask type: {self.attn_config.mask_type}"
                 )
 
+        assert isinstance(self.attn_config.inner_attention, FlexAttention.Config)
         return create_attention_mask(
-            and_masks(*mask_mods), B, None, input_batch.shape[1], input_batch.shape[1]
+            and_masks(*mask_mods),
+            B,
+            None,
+            input_batch.shape[1],
+            input_batch.shape[1],
+            BLOCK_SIZE=self.attn_config.inner_attention.block_size,
         )
 
     def get_attention_masks(
@@ -174,23 +192,22 @@ class Decoder(BaseModel):
         tokenizer: BaseTokenizer,
         extra_inputs: dict[str, torch.Tensor] | None = None,
     ) -> AttentionMasksType:
-        match self.attn_config.attn_backend:
-            case "flex":
-                return self._get_flex_attention_masks(
-                    input_batch, tokenizer, extra_inputs
+        inner_attn = self.attn_config.inner_attention
+        if isinstance(inner_attn, FlexAttention.Config):
+            return self._get_flex_attention_masks(input_batch, tokenizer, extra_inputs)
+        elif isinstance(inner_attn, VarlenAttention.Config):
+            if self.attn_config.mask_type != "block_causal":
+                raise ValueError(
+                    f"varlen attention is only supported with block_causal "
+                    f"attention mask type, got {self.attn_config.mask_type}"
                 )
-            case "varlen":
-                if self.attn_config.attn_mask_type != "block_causal":
-                    raise ValueError(
-                        f"varlen attention is only supported with block_causal "
-                        f"attention mask type, got {self.attn_config.attn_mask_type}"
-                    )
-                assert tokenizer.eos_id is not None
-                return create_varlen_metadata_for_document(
-                    input_batch, tokenizer.eos_id
-                )
-            case _:
-                raise TypeError("Only varlen and flex attn masks are supported")
+            assert tokenizer.eos_id is not None
+            return create_varlen_metadata_for_document(input_batch, tokenizer.eos_id)
+        else:
+            raise TypeError(
+                f"Only VarlenAttention and FlexAttention support attention masks, "
+                f"got {type(inner_attn).__name__}"
+            )
 
     @property
     def attn_config(self):

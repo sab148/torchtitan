@@ -26,13 +26,12 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
-
 from torchtitan.distributed.activation_checkpoint import apply_ac
-
+from torchtitan.distributed.compile import apply_compile_dense
+from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
 from torchtitan.models.llama3.parallelize import (
-    apply_compile,
-    apply_ddp,
+    apply_replicate,
     disable_fsdp_gradient_division,
 )
 from torchtitan.protocols.model_converter import ModelConvertersContainer
@@ -83,7 +82,7 @@ def parallelize_hf_transformers(
         apply_non_moe_tp(
             model,
             parallel_dims.get_mesh("tp"),
-            loss_parallel=not parallelism.disable_loss_parallel,
+            enable_loss_parallel=not parallelism.disable_loss_parallel,
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
         )
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
@@ -97,7 +96,7 @@ def parallelize_hf_transformers(
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if model_compile_enabled:
-        apply_compile(model, compile_config)
+        apply_compile_dense(model, compile_config)
 
     if parallel_dims.fsdp_enabled:
         # apply FSDP or HSDP, potentially with Context Parallel
@@ -128,13 +127,11 @@ def parallelize_hf_transformers(
         if training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
     elif parallel_dims.dp_replicate_enabled:
-        dp_replicate_mesh = parallel_dims.get_mesh("dp_replicate")
-        if parallel_dims.world_size != dp_replicate_mesh.size():
-            raise RuntimeError("DDP has not supported > 1D parallelism")
-        apply_ddp(
+        apply_replicate(
             model,
-            dp_replicate_mesh,
-            enable_compile=model_compile_enabled,
+            parallel_dims.get_mesh("dp_replicate"),
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         )
 
     return model
@@ -143,7 +140,7 @@ def parallelize_hf_transformers(
 def apply_non_moe_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
-    loss_parallel: bool,
+    enable_loss_parallel: bool,
     enable_float8_tensorwise_tp: bool,
 ):
     """Apply tensor parallelism."""
@@ -182,8 +179,8 @@ def apply_non_moe_tp(
         else:
             root_plan["output"] = ColwiseParallel(
                 input_layouts=Shard(1),
-                output_layouts=Shard(-1) if loss_parallel else Replicate(),
-                use_local_output=not loss_parallel,
+                output_layouts=Shard(-1) if enable_loss_parallel else Replicate(),
+                use_local_output=not enable_loss_parallel,
             )
     if root_plan:  # Only call if there's something to parallelize
         parallelize_module(model, tp_mesh, root_plan)
@@ -341,19 +338,9 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    match reshard_after_forward_policy:
-        case "always":
-            reshard_after_forward = True
-        case "never":
-            reshard_after_forward = False
-        case "default":
-            # For PP, by default do not reshard after forward to avoid per-microbatch
-            # all-gathers, which can be expensive and non-overlapped
-            reshard_after_forward = not pp_enabled
-        case _:
-            raise ValueError(
-                f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
-            )
+    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
+        reshard_after_forward_policy, pp_enabled
+    )
 
     if model.tok_embeddings is not None:
         fully_shard(
