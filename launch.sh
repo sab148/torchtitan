@@ -63,7 +63,12 @@ NPKG=$(python -c "import site, os; d=[p for p in site.getsitepackages() if p.end
 NGPU=${NGPU:-"8"}
 export LOG_RANK=${LOG_RANK:-0}
 MODEL=${MODEL:-"flux2"}
-CONFIG=${CONFIG:-"flux2_klein_4b_dataconsolidation"}
+CONFIG=${CONFIG:-"flux2_klein_4b_dataconsolidation"} # flux2_dev_dataconsolidation
+echo "CONFIG=$CONFIG"
+# if [ "$CONFIG" != "flux2_dev_dataconsolidation" ]; then
+#     echo "Refusing to launch: expected CONFIG=flux2_dev_dataconsolidation for Mistral, got CONFIG=$CONFIG" >&2
+#     exit 2
+# fi
 NNODES=${SLURM_JOB_NUM_NODES:-1}
 NPROC_PER_NODE=${GPUS_PER_NODE:-$NGPU}
 NODE_RANK=${SLURM_NODEID:-0}
@@ -115,6 +120,10 @@ torchrun --nnodes=${NNODES} \
     torchtitan/models/flux2/trainer.py \
     --module "$MODEL" \
     --config "$CONFIG" \
-    --training.local_batch_size "${BS:-4}" \
-    --training.steps "${STEPS:-100}" \
-    --metrics.log_freq "${LOG_FREQ:-1}"
+    --training.local_batch_size "${BS:-32}" \
+    --training.steps "${STEPS:-30000}" \
+    --metrics.log_freq "${LOG_FREQ:-100}" \
+    --encoder.text_encoder_cache_mode "${TEXT_ENCODER_CACHE_MODE:-off}" \
+    --encoder.text_encoder_cache_dir "${TEXT_ENCODER_CACHE_DIR:-/p/scratch/nxtaim-1/benassou1/clean_repo/torchtitan/storage/text_encoder_cache}" \
+    # --encoder.text_encoder_model "/p/scratch/nxtaim-1/benassou1/clean_repo/FLUX.2-dev/text_encoder" \
+    # --encoder.text_encoder_processor_model "/p/scratch/nxtaim-1/benassou1/clean_repo/FLUX.2-dev/tokenizer"

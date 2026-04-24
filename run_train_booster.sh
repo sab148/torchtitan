@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --account=nxtaim-1
-#SBATCH --nodes=4
-#SBATCH --partition=develbooster
+#SBATCH --account=nxtaim
+#SBATCH --nodes=8
+#SBATCH --partition=booster
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32  # 80 physical cores per node.
 #SBATCH --time=02:00:00
@@ -19,7 +19,16 @@ echo "----------------------------------"
 export SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"
 # so processes know who to talk to
 echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
+# nodes=( $(scontrol show hostnames "$SLURM_JOB_NODELIST") )
+# head_node="${nodes[0]}"
+# head_node_ip="$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)"
+# # Prefer an IPv4 address for torchrun rendezvous to avoid address-family mismatches.
+# if [[ "$head_node_ip" == *" "* ]]; then
+#     head_node_ip="$(printf '%s\n' "$head_node_ip" | tr ' ' '\n' | grep -m1 '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')"
+# fi
+# export MASTER_ADDR="${head_node_ip:-$head_node}"
 export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
+
 export MASTER_PORT=7010
 export GPUS_PER_NODE=4
 
@@ -29,6 +38,7 @@ export DEVICES_PER_NODE=4
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export NUM_NODES="$SLURM_JOB_NUM_NODES"
 export GLOO_SOCKET_IFNAME=ib0
+export NCCL_SOCKET_IFNAME=ib0
 
 # Try to reduce link flips.
 export NCCL_IB_TIMEOUT=100
@@ -47,14 +57,14 @@ export WANDB_MODE=offline
 # train_config="moe_opt_g_5T.toml"
 RUN_NAME=${RUN_NAME:-"flux2-train"}
 export MODULE=${MODULE:-"flux2"}
-export CONFIG=${CONFIG:-"flux2_klein_4b_dataconsolidation"}
+# export CONFIG=${CONFIG:-"flux2_dev_dataconsolidation"}
 
 # it will run on 4096 seqlen, local BS = 12, steps = 79473.  Should run 256 GPUS to be total of 1T tokens 
 
 steps=${STEPS:-30000}
 # BS=9
 # gradient_accumulation_steps=3
-BS=${BS:-4}
+BS=${BS:-16}
 gradient_accumulation_steps=1
 total_BS=$((BS * gradient_accumulation_steps * GPUS_PER_NODE * NUM_NODES))
 # total_BS=10368

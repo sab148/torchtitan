@@ -23,5 +23,11 @@ class Flux2EncoderConfig:
     text_encoder_processor_model: str = ""
     """Optional processor override for Mistral-based FLUX.2 text encoders."""
 
+    text_encoder_cache_mode: str = "off"
+    """Disk cache mode for text embeddings: off, read, write, or read_write."""
+
+    text_encoder_cache_dir: str = ""
+    """Shared directory for cached text embeddings. Empty disables disk caching."""
+
     random_init: bool = False
     """If True, initialize the autoencoder randomly instead of loading pretrained weights."""

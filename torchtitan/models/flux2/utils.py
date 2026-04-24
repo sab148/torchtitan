@@ -4,7 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import hashlib
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -235,6 +237,87 @@ def load_flux2_text_encoder(
     return encoder.eval().requires_grad_(False)
 
 
+class TextEmbeddingCache:
+    def __init__(
+        self,
+        *,
+        encoder_config: Flux2EncoderConfig,
+        text_encoder_kind: str,
+        max_length: int,
+    ):
+        mode = (encoder_config.text_encoder_cache_mode or "off").strip().lower().replace("-", "_")
+        if mode in {"", "off", "none", "disabled"}:
+            mode = "off"
+        if mode == "write":
+            # For this implementation, write mode also reuses existing entries.
+            mode = "read_write"
+        if mode not in {"off", "read", "read_write"}:
+            raise ValueError(
+                f"Unsupported text encoder cache mode: {encoder_config.text_encoder_cache_mode!r}"
+            )
+
+        self.mode = mode
+        cache_dir = (encoder_config.text_encoder_cache_dir or "").strip()
+        self.enabled = mode != "off" and bool(cache_dir)
+        self.cache_root = Path(cache_dir).expanduser().resolve() if cache_dir else None
+        model_spec = encoder_config.text_encoder_model or "default"
+        processor_spec = encoder_config.text_encoder_processor_model or "default"
+        namespace = f"kind={text_encoder_kind}|model={model_spec}|processor={processor_spec}|max_length={max_length}"
+        self.namespace_hash = hashlib.sha1(namespace.encode("utf-8")).hexdigest()[:16]
+
+        if self.enabled:
+            (self.cache_root / self.namespace_hash).mkdir(parents=True, exist_ok=True)
+
+    def _path_for_prompt(self, prompt: str) -> Path:
+        assert self.cache_root is not None
+        prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()
+        return self.cache_root / self.namespace_hash / prompt_hash[:2] / f"{prompt_hash}.pt"
+
+    def load(self, prompt: str) -> Tensor | None:
+        if not self.enabled or self.mode not in {"read", "read_write"}:
+            return None
+        path = self._path_for_prompt(prompt)
+        if not path.is_file():
+            return None
+        return torch.load(path, map_location="cpu")
+
+    def save(self, prompt: str, tensor: Tensor) -> None:
+        if not self.enabled or self.mode != "read_write":
+            return
+        path = self._path_for_prompt(prompt)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f".{os.getpid()}.tmp")
+        torch.save(tensor.detach().to("cpu"), tmp_path)
+        os.replace(tmp_path, path)
+
+    def encode(self, prompts: list[str], text_encoder: nn.Module) -> Tensor:
+        cached: list[Tensor | None] = [None] * len(prompts)
+        missing_indices: list[int] = []
+        missing_prompts: list[str] = []
+
+        for idx, prompt in enumerate(prompts):
+            cached_tensor = self.load(prompt)
+            if cached_tensor is None:
+                missing_indices.append(idx)
+                missing_prompts.append(prompt)
+            else:
+                cached[idx] = cached_tensor
+
+        if missing_prompts:
+            encoded_missing = text_encoder(missing_prompts)
+            if not isinstance(encoded_missing, torch.Tensor):
+                raise TypeError(
+                    "FLUX.2 text encoder must return a Tensor of hidden states."
+                )
+            encoded_missing = encoded_missing.detach().to("cpu")
+            for out_idx, prompt, tensor in zip(missing_indices, missing_prompts, encoded_missing):
+                cached[out_idx] = tensor
+                self.save(prompt, tensor)
+
+        assert all(t is not None for t in cached)
+        return torch.stack([t for t in cached if t is not None], dim=0)
+
+
 def normalize_prompts(prompts: Any) -> list[str]:
     if isinstance(prompts, str):
         return [prompts]
@@ -252,17 +335,21 @@ def preprocess_flux2_batch(
     autoencoder: AutoEncoder,
     text_encoder: nn.Module,
     batch: dict[str, Any],
+    text_embedding_cache: TextEmbeddingCache | None = None,
 ) -> dict[str, Any]:
     prompts = normalize_prompts(batch["prompt"])
     images = batch["image"].to(device=device, dtype=dtype)
 
     with torch.no_grad():
         img_encodings = autoencoder.encode(images).to(device=device, dtype=dtype)
-        text_encodings = text_encoder(prompts)
-        if not isinstance(text_encodings, torch.Tensor):
-            raise TypeError(
-                "FLUX.2 text encoder must return a Tensor of hidden states."
-            )
+        if text_embedding_cache is None:
+            text_encodings = text_encoder(prompts)
+            if not isinstance(text_encodings, torch.Tensor):
+                raise TypeError(
+                    "FLUX.2 text encoder must return a Tensor of hidden states."
+                )
+        else:
+            text_encodings = text_embedding_cache.encode(prompts, text_encoder)
         text_encodings = text_encodings.to(device=device, dtype=dtype)
 
     batch["prompt"] = prompts

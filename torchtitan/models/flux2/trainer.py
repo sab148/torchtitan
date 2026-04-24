@@ -34,6 +34,7 @@ try:
         load_flux2_text_encoder,
         load_flux2_transformer_state_dict,
         preprocess_flux2_batch,
+        TextEmbeddingCache,
     )
 except ImportError:
     from torchtitan.models.flux2.configs import Flux2EncoderConfig
@@ -48,6 +49,7 @@ except ImportError:
         load_flux2_text_encoder,
         load_flux2_transformer_state_dict,
         preprocess_flux2_batch,
+        TextEmbeddingCache,
     )
 
 
@@ -133,6 +135,11 @@ class Flux2Trainer(Trainer):
             parallel_dims=self.parallel_dims,
             training=config.training,
         )
+        self.text_embedding_cache = TextEmbeddingCache(
+            encoder_config=config.encoder,
+            text_encoder_kind=model_config.text_encoder_kind,
+            max_length=config.tokenizer.max_text_encoding_len,
+        )
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, Any], torch.Tensor]]
@@ -172,6 +179,7 @@ class Flux2Trainer(Trainer):
             autoencoder=self.autoencoder,
             text_encoder=self.text_encoder,
             batch=input_dict,
+            text_embedding_cache=self.text_embedding_cache,
         )
         labels = input_dict["img_encodings"]
 
