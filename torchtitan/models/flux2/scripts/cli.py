@@ -16,7 +16,6 @@ from flux2.sampling import (
     batched_prc_img,
     batched_prc_txt,
     denoise,
-    denoise_cached,
     denoise_cfg,
     encode_image_refs,
     get_schedule,
@@ -293,7 +292,6 @@ def main(
         model_name, debug_mode=debug_mode, device="cpu" if cpu_offloading else torch_device
     )
     ae = load_ae(model_name)
-    model.eval()
     ae.eval()
     text_encoder.eval()
 
@@ -585,12 +583,7 @@ def main(
 
                 timesteps = get_schedule(cfg.num_steps, x.shape[1])
                 if model_info["guidance_distilled"]:
-                    denoise_fn = (
-                        denoise_cached
-                        if (model_info.get("use_kv_cache") and ref_tokens is not None)
-                        else denoise
-                    )
-                    x = denoise_fn(
+                    x = denoise(
                         model,
                         x,
                         x_ids,

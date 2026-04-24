@@ -23,7 +23,6 @@ This repo contains minimal inference code to run image generation & editing with
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | [FLUX.2 [klein] 4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | ✅ | ✅ | ✅ | ✅ | ✅ | [apache-2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md) |
 | [FLUX.2 [klein] 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) | ✅ | ✅ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
-| [FLUX.2 [klein] 9B KV](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-kv) | ✅ | ✅ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
 | [FLUX.2 [klein] 4B Base](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B) | ❌ | ❌ | ✅ | ✅ | ✅ | [apache-2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md) |
 | [FLUX.2 [klein] 9B Base](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) | ❌ | ❌ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
 | [FLUX.2 [dev]](https://huggingface.co/black-forest-labs/FLUX.2-dev) | ❌ | ✅ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
@@ -34,7 +33,7 @@ This repo contains minimal inference code to run image generation & editing with
 
 | Need | Recommended |
 |------|-------------|
-| Real-time apps, interactive workflows | [klein] 4B, 9B, or 9B KV (distilled) |
+| Real-time apps, interactive workflows | [klein] 4B or 9B (distilled) |
 | Consumer GPU (e.g. RTX 3090/4070) | [klein] 4B |
 | Fine-tuning, LoRA training | [klein] Base or FLUX.2 [dev] |
 | Maximum quality, no latency constraints | FLUX.2 [dev] |
@@ -63,8 +62,7 @@ Klein models define the Pareto frontier for quality vs. latency and VRAM across 
 | Model | Best For |
 |:---|:---|
 | **[klein] 4B** | Maximum speed, consumer hardware, edge deployment |
-| **[klein] 9B** | High quality text-to-image; for image editing, 9B KV is faster at equal quality |
-| **[klein] 9B KV** | Best quality-to-latency ratio, faster than 4B for multi-reference image editing via [KV caching](docs/flux2_klein_kv_cache.md) |
+| **[klein] 9B** | Best quality-to-latency ratio, production apps |
 | **[klein] 4B Base** | Fine-tuning on limited hardware, full customization |
 | **[klein] 9B Base** | Research, LoRA training, maximum output diversity |
 
@@ -130,7 +128,6 @@ export AE_MODEL_PATH="<ae_path>"
 export KLEIN_4B_MODEL_PATH="<klein_4b_path>"
 export KLEIN_4B_BASE_MODEL_PATH="<klein_4b_base_path>"
 export KLEIN_9B_MODEL_PATH="<klein_9b_path>"
-export KLEIN_9B_KV_MODEL_PATH="<klein_9b_kv_path>"
 export KLEIN_9B_BASE_MODEL_PATH="<klein_9b_base_path>"
 ```
 

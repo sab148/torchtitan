@@ -12,7 +12,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 
 from torchtitan.config import (
     ActivationCheckpointConfig,
@@ -22,6 +22,7 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.context_parallel import apply_cp_to_attention_module
 from torchtitan.models.llama3.parallelize import disable_fsdp_gradient_division
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.tools.logging import logger
@@ -38,18 +39,13 @@ def parallelize_flux2(
     ac_config: ActivationCheckpointConfig,
     dump_folder: str,
 ):
-    del model_converters, parallelism, dump_folder
+    del model_converters, parallelism, compile_config, dump_folder
 
     if ac_config.mode != "none":
         apply_ac(model, ac_config)
 
     if parallel_dims.cp_enabled:
-        raise NotImplementedError(
-            "FLUX.2 context parallel is not implemented in this TorchTitan integration."
-        )
-
-    if compile_config.enable and "model" in compile_config.components:
-        apply_compile(model, compile_config)
+        apply_cp(model, parallel_dims.get_mesh("cp"))
 
     if parallel_dims.fsdp_enabled:
         names = (
@@ -84,140 +80,67 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    sharded_modules = [
+    linear_layers = [
         model.img_in,
         model.time_in,
         model.txt_in,
+    ]
+    if hasattr(model, "guidance_in"):
+        linear_layers.append(model.guidance_in)
+
+    for layer in linear_layers:
+        # pyrefly: ignore [no-matching-overload]
+        fully_shard(layer, **fsdp_config)
+
+    for module in [
         model.double_stream_modulation_img,
         model.double_stream_modulation_txt,
         model.single_stream_modulation,
-    ]
-    if hasattr(model, "guidance_in"):
-        sharded_modules.append(model.guidance_in)
-
-    for module in sharded_modules:
+        model.final_layer,
+    ]:
+        # pyrefly: ignore [no-matching-overload]
         fully_shard(module, **fsdp_config)
 
     for block in model.double_blocks:
+        # pyrefly: ignore [no-matching-overload]
         fully_shard(block, **fsdp_config)
 
     for block in model.single_blocks:
+        # pyrefly: ignore [no-matching-overload]
         fully_shard(block, **fsdp_config)
 
-    fully_shard(model.final_layer, **fsdp_config, reshard_after_forward=False)
+    # Wrap all the rest of model
     fully_shard(model, **fsdp_config)
+
+    # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)
 
 
-def apply_compile(model: nn.Module, compile_config: CompileConfig):
-    for block in model.double_blocks:
-        block.compile(backend=compile_config.backend, fullgraph=True)
-
-    for block in model.single_blocks:
-        block.compile(backend=compile_config.backend, fullgraph=True)
-
-    logger.info("Compiling each FLUX.2 transformer block with torch.compile")
-
-
 def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig) -> None:
+    # pyrefly: ignore [missing-attribute]
     for layer_id, block in model.double_blocks.named_children():
-        wrapped = ptd_checkpoint_wrapper(block, preserve_rng_state=False)
-        model.double_blocks.register_module(layer_id, wrapped)
+        block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
+        # pyrefly: ignore [missing-attribute]
+        model.double_blocks.register_module(layer_id, block)
 
+    # pyrefly: ignore [missing-attribute]
     for layer_id, block in model.single_blocks.named_children():
-        wrapped = ptd_checkpoint_wrapper(block, preserve_rng_state=False)
-        model.single_blocks.register_module(layer_id, wrapped)
+        block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
+        # pyrefly: ignore [missing-attribute]
+        model.single_blocks.register_module(layer_id, block)
 
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the FLUX.2 model")
 
 
-def _get_submodule_or_none(module: nn.Module, path: str) -> nn.Module | None:
-    current = module
-    for name in path.split("."):
-        if not hasattr(current, name):
-            return None
-        current = getattr(current, name)
-    return current if isinstance(current, nn.Module) else None
+def apply_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
+    attention_modules = []
 
+    for block in model.double_blocks:
+        attention_modules.append(block.inner_attention)
 
-def _find_transformer_blocks(module: nn.Module) -> tuple[str, nn.ModuleList] | None:
-    preferred_paths = (
-        "model.layers",
-        "language_model.model.layers",
-        "language_model.layers",
-        "model.model.layers",
-        "transformer.h",
-        "encoder.block",
-    )
-    for path in preferred_paths:
-        candidate = _get_submodule_or_none(module, path)
-        if isinstance(candidate, nn.ModuleList) and len(candidate) > 0:
-            return path, candidate
+    for block in model.single_blocks:
+        attention_modules.append(block.inner_attention)
 
-    candidates: list[tuple[str, nn.ModuleList]] = []
-    for name, submodule in module.named_modules():
-        if not isinstance(submodule, nn.ModuleList) or len(submodule) == 0:
-            continue
-        lowered = name.lower()
-        if any(token in lowered for token in ("layers", "blocks", "block", ".h", "h.")):
-            candidates.append((name, submodule))
+    apply_cp_to_attention_module(attention_modules, cp_mesh, "sdpa")
 
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda item: (
-            len(item[1]),
-            sum(p.numel() for p in item[1].parameters()),
-        ),
-        reverse=True,
-    )
-    return candidates[0]
-
-
-def parallelize_text_encoder(
-    text_encoder: nn.Module,
-    *,
-    parallel_dims: ParallelDims,
-    training: TrainingConfig,
-) -> nn.Module:
-    if not parallel_dims.dp_shard_enabled:
-        return text_encoder
-
-    model_root = getattr(text_encoder, "model", None)
-    if not isinstance(model_root, nn.Module):
-        model_root = getattr(text_encoder, "hf_module", None)
-    if not isinstance(model_root, nn.Module):
-        logger.warning(
-            "Skipping FLUX.2 text encoder FSDP because no shardable model root was found."
-        )
-        return text_encoder
-
-    names = (
-        ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-    )
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-    )
-    fsdp_config: dict[str, Any] = {
-        "mesh": parallel_dims.get_mesh(names),
-        "mp_policy": mp_policy,
-    }
-    if training.enable_cpu_offload:
-        fsdp_config["offload_policy"] = CPUOffloadPolicy()
-
-    found_blocks = _find_transformer_blocks(model_root)
-    if found_blocks is not None:
-        block_path, blocks = found_blocks
-        for block in blocks:
-            fully_shard(block, **fsdp_config)
-        logger.info(f"Applied block-wise FSDP to FLUX.2 text encoder at {block_path}")
-    else:
-        logger.warning(
-            "Falling back to root-only FSDP for the FLUX.2 text encoder; no block list was found."
-        )
-
-    fully_shard(model_root, **fsdp_config)
-    disable_fsdp_gradient_division(model_root)
-    return text_encoder
+    logger.info("Applied Context Parallel to the FLUX.2 model")
