@@ -5,7 +5,7 @@ import torch
 from einops import rearrange
 from torch import Tensor, nn
 
-from torchtitan.models.common.attention import ScaledDotProductAttentionWrapper
+from torchtitan.models.common.attention import ScaledDotProductAttention
 
 
 @dataclass
@@ -253,7 +253,7 @@ class SingleStreamBlock(nn.Module):
         self.linear2 = nn.Linear(hidden_size + self.mlp_hidden_dim, hidden_size, bias=False)
 
         self.norm = QKNorm(head_dim)
-        self.inner_attention = ScaledDotProductAttentionWrapper()
+        self.inner_attention = ScaledDotProductAttention(ScaledDotProductAttention.Config())
 
         self.hidden_size = hidden_size
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -318,7 +318,7 @@ class DoubleStreamBlock(nn.Module):
             dim=hidden_size,
             num_heads=num_heads,
         )
-        self.inner_attention = ScaledDotProductAttentionWrapper()
+        self.inner_attention = ScaledDotProductAttention(ScaledDotProductAttention.Config())
 
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_mlp = nn.Sequential(
@@ -466,7 +466,7 @@ def attention(
     k: Tensor,
     v: Tensor,
     pe: Tensor,
-    inner_attention: ScaledDotProductAttentionWrapper | None = None,
+    inner_attention: ScaledDotProductAttention | None = None,
 ) -> Tensor:
     q, k = apply_rope(q, k, pe)
 

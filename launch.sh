@@ -2,9 +2,11 @@
 
 export PYTHONUNBUFFERED=1 
 
-export HF_HOME=/p/scratch/nxtaim-1/benassou1/clean_repo/torchtitan/assets/hf
-export HF_HUB_CACHE=$HF_HOME/hub
-export TRANSFORMERS_CACHE=$HF_HOME/hub
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+export HF_HOME="${HF_HOME:-${SCRIPT_DIR}/assets/hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/hub}"
 unset HF_HUB_OFFLINE  # only if you need downloads
 
 # export HF_HOME=/p/project1/atmlaml/$USER/hf
@@ -13,9 +15,18 @@ unset HF_HUB_OFFLINE  # only if you need downloads
 # Default to local HF cache if present (used for offline runs).
 # Prefer the real HuggingFace cache if it exists.
 HF_CACHE_PREFERRED="/p/home/jusers/benassou1/juwels/.cache/huggingface"
-HF_CACHE_FALLBACK="/p/scratch/nxtaim-1/benassou1/clean_repo/torchtitan/assets/hf"
-# Prefer the real HF cache if it exists. Override any pre-set HF_HOME to avoid mismatches.
-if [ -d "$HF_CACHE_PREFERRED/hub" ]; then
+HF_CACHE_FALLBACK="${SCRIPT_DIR}/assets/hf"
+# Respect an existing valid HF cache path first; otherwise prefer the shared
+# cache, then fall back to the repo-local assets cache.
+if [ -n "${HF_HUB_CACHE:-}" ] && [ -d "${HF_HUB_CACHE}" ]; then
+    if [ "$(basename "${HF_HUB_CACHE}")" = "hub" ]; then
+        export HF_HOME="$(dirname "${HF_HUB_CACHE}")"
+    else
+        export HF_HOME="${HF_HUB_CACHE}"
+    fi
+elif [ -n "${HF_HOME:-}" ] && [ -d "${HF_HOME}/hub" ]; then
+    export HF_HOME="${HF_HOME}"
+elif [ -d "$HF_CACHE_PREFERRED/hub" ]; then
     export HF_HOME="$HF_CACHE_PREFERRED"
 elif [ -d "$HF_CACHE_FALLBACK" ]; then
     export HF_HOME="$HF_CACHE_FALLBACK"
@@ -35,7 +46,7 @@ export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
 # Use local FLUX.2 autoencoder weights when available (offline-friendly).
-AE_DEFAULT="/p/scratch/nxtaim-1/benassou1/clean_repo/torchtitan/assets/hf/FLUX.2-dev/ae.safetensors"
+AE_DEFAULT="${SCRIPT_DIR}/assets/hf/FLUX.2-dev/ae.safetensors"
 if [ -z "${AE_MODEL_PATH:-}" ] && [ -f "$AE_DEFAULT" ]; then
     export AE_MODEL_PATH="$AE_DEFAULT"
 fi
@@ -63,7 +74,7 @@ NPKG=$(python -c "import site, os; d=[p for p in site.getsitepackages() if p.end
 NGPU=${NGPU:-"8"}
 export LOG_RANK=${LOG_RANK:-0}
 MODEL=${MODEL:-"flux2"}
-CONFIG=${CONFIG:-"flux2_klein_4b_dataconsolidation"} # flux2_dev_dataconsolidation
+CONFIG=${CONFIG:-"flux2_dev_dataconsolidation"}
 echo "CONFIG=$CONFIG"
 # if [ "$CONFIG" != "flux2_dev_dataconsolidation" ]; then
 #     echo "Refusing to launch: expected CONFIG=flux2_dev_dataconsolidation for Mistral, got CONFIG=$CONFIG" >&2
@@ -76,7 +87,8 @@ RDZV_ID=${SLURM_JOB_ID:-flux2-local}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
 
-export PYTHONPATH=/p/scratch/nxtaim-1/benassou1/clean_repo/torchtitan:${PYTHONPATH}
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
+export PYTHONPATH="${SCRIPT_DIR}/torchtitan/models/flux2:${PYTHONPATH}"
 
 # Keep the cluster scientific stack consistent: prefer the module-provided
 # SciPy/numpy/h5py paths ahead of the venv site-packages to avoid ABI mismatches.
@@ -117,7 +129,7 @@ torchrun --nnodes=${NNODES} \
     --local-ranks-filter 0 \
     --role rank \
     --tee 3 \
-    torchtitan/models/flux2/trainer.py \
+    -m torchtitan.train \
     --module "$MODEL" \
     --config "$CONFIG" \
     --training.local_batch_size "${BS:-32}" \

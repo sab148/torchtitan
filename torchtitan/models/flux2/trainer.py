@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -242,7 +243,7 @@ class Flux2Trainer(Trainer):
             )
 
         with self.train_context():
-            with self.maybe_enable_amp:
+            with contextlib.nullcontext():
                 pred = model(
                     x=img_seq,
                     x_ids=img_ids,

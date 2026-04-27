@@ -18,18 +18,14 @@ from torchtitan.models.flux2.trainer import Flux2Trainer
 from . import model_registry
 
 
+_DATA_CONSOLIDATION_ROOT = Path(__file__).resolve().parent / "DataConsolidation"
+
 _DATA_CONSOLIDATION_CONFIG = (
-    Path(__file__).resolve().parents[3]
-    / "DataConsolidation"
-    / "config"
-    / "joint_train_dataset.yaml"
+    _DATA_CONSOLIDATION_ROOT / "config" / "joint_train_dataset.yaml"
 )
 
 _DATA_CONSOLIDATION_PREFETCH_CONFIG = (
-    Path(__file__).resolve().parents[3]
-    / "DataConsolidation"
-    / "config"
-    / "joint_train_dataset_prefetch.yaml"
+    _DATA_CONSOLIDATION_ROOT / "config" / "joint_train_dataset_prefetch.yaml"
 )
 
 
