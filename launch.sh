@@ -74,7 +74,7 @@ NPKG=$(python -c "import site, os; d=[p for p in site.getsitepackages() if p.end
 NGPU=${NGPU:-"8"}
 export LOG_RANK=${LOG_RANK:-0}
 MODEL=${MODEL:-"flux2"}
-CONFIG=${CONFIG:-"flux2_dev_dataconsolidation"}
+CONFIG=${CONFIG:-"flux2_klein_4b_dataconsolidation"}
 echo "CONFIG=$CONFIG"
 # if [ "$CONFIG" != "flux2_dev_dataconsolidation" ]; then
 #     echo "Refusing to launch: expected CONFIG=flux2_dev_dataconsolidation for Mistral, got CONFIG=$CONFIG" >&2
@@ -129,9 +129,11 @@ torchrun --nnodes=${NNODES} \
     --local-ranks-filter 0 \
     --role rank \
     --tee 3 \
-    -m torchtitan.train \
+    torchtitan/models/flux2/trainer.py \
     --module "$MODEL" \
     --config "$CONFIG" \
+    --checkpoint.initial_load_path "${RESUME_CHECKPOINT:-/p/scratch/nxtaim-1/benassou1/clean_repo/torchtitan/outputs/checkpoint}" \
+    --checkpoint.load_step "${CHECKPOINT_LOAD_STEP:--1}" \
     --training.local_batch_size "${BS:-32}" \
     --training.steps "${STEPS:-30000}" \
     --metrics.log_freq "${LOG_FREQ:-100}" \

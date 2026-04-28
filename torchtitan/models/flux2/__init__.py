@@ -7,21 +7,21 @@
 from torchtitan.components.loss import build_mse_loss
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .flux2_datasets import Flux2DataLoader
-from .model import Flux2Model
+from .flux_datasets import Flux2DataLoader
+from .model.model import Flux2Model
 from .parallelize import parallelize_flux2
+from .src.flux2.autoencoder import AutoEncoderParams
+from .src.flux2.model import Flux2Params, Klein4BParams, Klein9BParams
 
-from torchtitan.models.flux2.src.flux2.model import Flux2Params, Klein4BParams, Klein9BParams
-
-__all__ = [
-    "Flux2Model",
-    "Flux2DataLoader",
-    "flux2_configs",
-    "parallelize_flux2",
-]
+__all__ = ["Flux2Model", "Flux2DataLoader", "flux2_configs", "parallelize_flux2"]
 
 
-def _config_from_params(params) -> Flux2Model.Config:
+def _build_model_config(
+    params: Flux2Params | Klein4BParams | Klein9BParams,
+    *,
+    text_encoder_kind: str,
+    guidance: float,
+) -> Flux2Model.Config:
     return Flux2Model.Config(
         in_channels=params.in_channels,
         context_in_dim=params.context_in_dim,
@@ -33,15 +33,58 @@ def _config_from_params(params) -> Flux2Model.Config:
         theta=params.theta,
         mlp_ratio=params.mlp_ratio,
         use_guidance_embed=params.use_guidance_embed,
+        autoencoder_params=AutoEncoderParams(),
+        text_encoder_kind=text_encoder_kind,
+        guidance=guidance,
     )
 
 
 flux2_configs = {
-    "flux2-dev": _config_from_params(Flux2Params()),
-    "flux2-klein-4b": _config_from_params(Klein4BParams()),
-    "flux2-klein-9b": _config_from_params(Klein9BParams()),
-    "flux2-klein-base-4b": _config_from_params(Klein4BParams()),
-    "flux2-klein-base-9b": _config_from_params(Klein9BParams()),
+    "flux.2-dev": _build_model_config(
+        Flux2Params(),
+        text_encoder_kind="mistral",
+        guidance=4.0,
+    ),
+    "flux.2-klein-4b": _build_model_config(
+        Klein4BParams(),
+        text_encoder_kind="qwen3-4b",
+        guidance=1.0,
+    ),
+    "flux.2-klein-9b": _build_model_config(
+        Klein9BParams(),
+        text_encoder_kind="qwen3-8b",
+        guidance=1.0,
+    ),
+    "flux.2-klein-9b-kv": _build_model_config(
+        Klein9BParams(),
+        text_encoder_kind="qwen3-8b",
+        guidance=1.0,
+    ),
+    "flux.2-klein-base-4b": _build_model_config(
+        Klein4BParams(),
+        text_encoder_kind="qwen3-4b",
+        guidance=4.0,
+    ),
+    "flux.2-klein-base-9b": _build_model_config(
+        Klein9BParams(),
+        text_encoder_kind="qwen3-8b",
+        guidance=4.0,
+    ),
+    "flux.2-debug": Flux2Model.Config(
+        in_channels=128,
+        context_in_dim=15360,
+        hidden_size=1024,
+        num_heads=8,
+        depth=2,
+        depth_single_blocks=4,
+        axes_dim=(32, 32, 32, 32),
+        theta=2000,
+        mlp_ratio=3.0,
+        use_guidance_embed=True,
+        autoencoder_params=AutoEncoderParams(),
+        text_encoder_kind="mistral",
+        guidance=4.0,
+    ),
 }
 
 

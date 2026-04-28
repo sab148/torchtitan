@@ -4,7 +4,7 @@
 #SBATCH --partition=develbooster
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32  # 80 physical cores per node.
-#SBATCH --time=00:30:00
+#SBATCH --time=00:10:00
 #SBATCH --gres=gpu:4
 #SBATCH -o cache/slurm_output/%j_%a.log  # %j will be replaced by the job ID, %a by array index
 #SBATCH --array=1
