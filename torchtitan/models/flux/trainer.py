@@ -28,7 +28,6 @@ from torchtitan.models.flux.utils import (
 )
 from torchtitan.trainer import Trainer
 
-
 class FluxTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):

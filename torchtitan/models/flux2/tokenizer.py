@@ -14,7 +14,7 @@ class Flux2TokenizerContainer(BaseTokenizer):
 
     FLUX.2 tokenization is handled inside the real text encoder, but TorchTitan's
     Trainer still expects a tokenizer component to exist. This container only
-    carries the requested max text length through the config system.
+    exists to satisfy that framework-level interface.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -23,8 +23,7 @@ class Flux2TokenizerContainer(BaseTokenizer):
 
     def __init__(self, config: Config, **kwargs):
         super().__init__()
-        del kwargs
-        self.max_text_encoding_len = config.max_text_encoding_len
+        del config, kwargs
 
     def encode(self, *args, **kwargs) -> list[int]:
         del args, kwargs

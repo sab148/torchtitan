@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --account=nxtaim-1
-#SBATCH --nodes=1
-#SBATCH --partition=develbooster
+#SBATCH --nodes=32
+#SBATCH --partition=booster
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32  # 80 physical cores per node.
-#SBATCH --time=00:10:00
+#SBATCH --cpus-per-task=72  # 80 physical cores per node.
+#SBATCH --time=00:15:00
 #SBATCH --gres=gpu:4
 #SBATCH -o cache/slurm_output/%j_%a.log  # %j will be replaced by the job ID, %a by array index
 #SBATCH --array=1
@@ -47,7 +47,8 @@ export NCCL_IB_RETRY_CNT=10
 
 echo "Job id: $SLURM_JOB_ID"
 # We activate our environemnt
-source /p/scratch/nxtaim-1/benassou1/clean_repo/torchtitan/sc_venv_template/activate.sh
+# source /p/scratch/nxtaim-1/benassou1/clean_repo/torchtitan/sc_venv_template/activate.sh
+source /p/scratch/nxtaim-1/benassou1/clean_repo/new_repo/torchtitan/sc_venv_template/activate.sh
 
 
 # Set a default TMPDIR if not already set

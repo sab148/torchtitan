@@ -588,6 +588,19 @@ class Qwen3Embedder(nn.Module):
             model_kwargs["cache_dir"] = cache_dir
             tokenizer_kwargs["cache_dir"] = cache_dir
 
+        # In diffusers-format checkpoints, model weights and tokenizer live in
+        # separate sibling directories (e.g. text_encoder/ and tokenizer/).
+        # Fall back to the sibling tokenizer/ dir when the model dir has no
+        # tokenizer files.
+        resolved_tokenizer_spec = resolved_model_spec
+        model_path = Path(resolved_model_spec)
+        if model_path.is_dir():
+            _tokenizer_files = ("tokenizer.json", "tokenizer_config.json", "vocab.json")
+            if not any((model_path / f).exists() for f in _tokenizer_files):
+                sibling_tokenizer = model_path.parent / "tokenizer"
+                if sibling_tokenizer.is_dir():
+                    resolved_tokenizer_spec = str(sibling_tokenizer)
+
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
                 resolved_model_spec,
@@ -595,7 +608,7 @@ class Qwen3Embedder(nn.Module):
             )
 
             self.tokenizer = AutoTokenizer.from_pretrained(
-                resolved_model_spec,
+                resolved_tokenizer_spec,
                 **tokenizer_kwargs,
             )
         except OSError as exc:

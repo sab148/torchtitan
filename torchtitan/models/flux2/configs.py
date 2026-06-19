@@ -17,6 +17,9 @@ class Flux2EncoderConfig:
     transformer_path: str = ""
     """Optional local path to pretrained FLUX.2 transformer weights in safetensors format."""
 
+    max_text_encoding_len: int = 512
+    """Maximum text sequence length requested from the FLUX.2 text encoder."""
+
     text_encoder_model: str = ""
     """Optional local or Hugging Face override for the FLUX.2 text encoder weights."""
 

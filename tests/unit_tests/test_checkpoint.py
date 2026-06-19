@@ -402,6 +402,70 @@ class TestCheckpointManager(unittest.TestCase):
         manager2.close()
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torchtitan.components.checkpoint.dcp.load")
+    def test_initial_load_path_parent_folder_resolves_latest_step(
+        self, mock_load, mock_rank
+    ):
+        for step in (1, 3):
+            step_dir = os.path.join(self.test_folder, f"step-{step}")
+            os.makedirs(step_dir, exist_ok=True)
+            open(os.path.join(step_dir, ".metadata"), "a").close()
+
+        cfg = self.trainer_config.checkpoint
+        cfg.initial_load_path = self.test_folder
+        cfg.folder = "missing-output-folder"
+
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=cfg,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        self.assertTrue(manager.load(step=-1))
+        _, kwargs = mock_load.call_args
+        self.assertEqual(
+            kwargs.get("checkpoint_id"), os.path.join(self.test_folder, "step-3")
+        )
+        manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torchtitan.components.checkpoint.dcp.load")
+    def test_initial_load_path_parent_folder_resolves_explicit_step(
+        self, mock_load, mock_rank
+    ):
+        for step in (1, 3):
+            step_dir = os.path.join(self.test_folder, f"step-{step}")
+            os.makedirs(step_dir, exist_ok=True)
+            open(os.path.join(step_dir, ".metadata"), "a").close()
+
+        cfg = self.trainer_config.checkpoint
+        cfg.initial_load_path = self.test_folder
+        cfg.folder = "missing-output-folder"
+
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=cfg,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        self.assertTrue(manager.load(step=1))
+        _, kwargs = mock_load.call_args
+        self.assertEqual(
+            kwargs.get("checkpoint_id"), os.path.join(self.test_folder, "step-1")
+        )
+        manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torch.cuda.Stream")
     @mock.patch("torchtitan.components.checkpoint.DefaultStager")
     @mock.patch("torchtitan.components.checkpoint.dist.new_group")

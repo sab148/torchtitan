@@ -21,9 +21,16 @@ from torch.utils.data import IterableDataset
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
-from datasets import load_dataset
+
 
 DATA_CONSOLIDATION_DATASET = "data-consolidation"
+
+
+def _load_hf_dataset(*args, **kwargs):
+    from datasets import load_dataset
+
+    return load_dataset(*args, **kwargs)
+
 
 def _split_hf_dataset_by_node(dataset, dp_rank: int, dp_world_size: int):
     from datasets.distributed import split_dataset_by_node
@@ -144,6 +151,72 @@ def _load_data_consolidation_dataset(config_path: str, split_name: str = 'train_
     return dataset
 
 
+def _has_local_tar_shards(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    with os.scandir(path) as entries:
+        return any(entry.name.endswith(".tar") for entry in entries)
+
+
+def _resolve_cached_hf_dataset_snapshot(repo_id: str) -> str | None:
+    hub_cache = os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if not hub_cache:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home:
+            hub_cache = os.path.join(hf_home, "hub")
+    if not hub_cache:
+        return None
+
+    repo_cache = os.path.join(hub_cache, f"datasets--{repo_id.replace('/', '--')}")
+    snapshots_dir = os.path.join(repo_cache, "snapshots")
+    if not os.path.isdir(snapshots_dir):
+        return None
+
+    revisions: list[str] = []
+    ref_path = os.path.join(repo_cache, "refs", "main")
+    if os.path.isfile(ref_path):
+        with open(ref_path) as ref_file:
+            revision = ref_file.read().strip()
+        if revision:
+            revisions.append(revision)
+
+    for revision in sorted(os.listdir(snapshots_dir), reverse=True):
+        if revision not in revisions:
+            revisions.append(revision)
+
+    for revision in revisions:
+        snapshot_path = os.path.join(snapshots_dir, revision)
+        if _has_local_tar_shards(snapshot_path):
+            return snapshot_path
+
+    return None
+
+
+def _load_cc12m_wds_dataset(path: str):
+    if _has_local_tar_shards(path):
+        logger.info(f"Loading cc12m-wds from local tar shard directory {path}")
+        return _load_hf_dataset(
+            path,
+            split="train",
+            data_files={"train": "*.tar"},
+            streaming=True,
+        )
+
+    cached_snapshot_path = _resolve_cached_hf_dataset_snapshot(path)
+    if cached_snapshot_path is not None:
+        logger.info(
+            f"Loading cc12m-wds from cached HuggingFace snapshot {cached_snapshot_path}"
+        )
+        return _load_hf_dataset(
+            cached_snapshot_path,
+            split="train",
+            data_files={"train": "*.tar"},
+            streaming=True,
+        )
+
+    return _load_hf_dataset(path, split="train", streaming=True)
+
+
 def _process_image(
     img: PIL.Image.Image,
     output_size: int = 256,
@@ -197,19 +270,19 @@ def _coco_data_processor(
 DATASETS = {
     "cc12m-wds": DatasetConfig(
         path="pixparse/cc12m-wds",
-        loader=lambda path: load_dataset(path, split="train", streaming=True),
+        loader=_load_cc12m_wds_dataset,
         sample_processor=_cc12m_wds_data_processor,
     ),
     "cc12m-test": DatasetConfig(
         path="tests/assets/cc12m_test",
-        loader=lambda path: load_dataset(
+        loader=lambda path: _load_hf_dataset(
             path, split="train", data_files={"train": "*.tar"}, streaming=True
         ),
         sample_processor=_cc12m_wds_data_processor,
     ),
     "coco-validation": DatasetConfig(
         path="howard-hou/COCO-Text",
-        loader=lambda path: load_dataset(path, split="validation", streaming=True),
+        loader=lambda path: _load_hf_dataset(path, split="validation", streaming=True),
         sample_processor=_coco_data_processor,
     ),
     DATA_CONSOLIDATION_DATASET: DatasetConfig(
@@ -231,6 +304,8 @@ def _validate_dataset(
 
     config = DATASETS[dataset_name]
     path = dataset_path or config.path
+    if dataset_name == DATA_CONSOLIDATION_DATASET and not path:
+        raise ValueError("Dataset 'data-consolidation' requires dataset_path to point to a DataConsolidation YAML config")
     logger.info(f"Preparing {dataset_name} dataset from {path}")
     return path, config.loader, config.sample_processor
 

@@ -221,7 +221,14 @@ class AsyncPrefetchedDatasetWrapper(Dataset):
                     print(f"Unexpected exception when getting the next sample index: {e}")
                 index = random.randint(0, len(self.base_dataset) - 1)
 
-            sample = self.base_dataset[index]
+            try:
+                sample = self.base_dataset[index]
+            except Exception as exc:
+                print(
+                    f"Prefetch worker failed to load sample index {index}: {exc}",
+                    flush=True,
+                )
+                continue
 
             while not self.stop_event.is_set():
                 # wait until the sample can be added to the buffer without 

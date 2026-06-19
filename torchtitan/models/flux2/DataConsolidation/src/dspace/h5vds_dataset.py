@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torchvision.transforms.v2 as v2
 import yaml
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms.v2.functional import center_crop
 
@@ -84,28 +84,35 @@ class H5VDSDataset(Dataset):
         filename = self._filenames[index]
         if isinstance(caption, bytes):
             caption = caption.decode("utf-8")
+        if isinstance(filename, bytes):
+            filename = filename.decode("utf-8")
 
-        with io.BytesIO(img_blob) as byte_stream:
-            with Image.open(byte_stream) as img:
-                img = img.convert("RGB")
-                orig_w, orig_h = img.size
+        try:
+            with io.BytesIO(img_blob) as byte_stream:
+                with Image.open(byte_stream) as img:
+                    img = img.convert("RGB")
+                    orig_w, orig_h = img.size
 
-                # Optional random center-crop that effects FOVs
-                if self.augment_camera and self.augment_camera_prob is not None:
-                    if random.random() > self.augment_camera_prob:
-                        new_h = random.randint(orig_h // 2, orig_h)
-                        new_w = random.randint(orig_w // 2, orig_w)
-                        img = center_crop(img, output_size=[new_h, new_w])
-                        hfov, vfov = self._get_focal_lengths(filename, new_w, new_h)
-                        aspect = float(new_w) / float(new_h)
+                    # Optional random center-crop that effects FOVs
+                    if self.augment_camera and self.augment_camera_prob is not None:
+                        if random.random() > self.augment_camera_prob:
+                            new_h = random.randint(orig_h // 2, orig_h)
+                            new_w = random.randint(orig_w // 2, orig_w)
+                            img = center_crop(img, output_size=[new_h, new_w])
+                            hfov, vfov = self._get_focal_lengths(filename, new_w, new_h)
+                            aspect = float(new_w) / float(new_h)
+                        else:
+                            hfov, vfov = self._get_focal_lengths(filename, orig_w, orig_h)
+                            aspect = float(orig_w) / float(orig_h)
                     else:
-                        hfov, vfov = self._get_focal_lengths(filename, orig_w, orig_h)
-                        aspect = float(orig_w) / float(orig_h)
-                else:
-                    hfov, vfov = -1.0, -1.0
-                    aspect = -1.0
+                        hfov, vfov = -1.0, -1.0
+                        aspect = -1.0
 
-                img_t = self.transforms(img)
+                    img_t = self.transforms(img)
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise ValueError(
+                f"Failed to decode image_bytes for {self.vds_path} at index={index}, filename={filename!r}"
+            ) from exc
 
         return {
             "jpg": img_t,

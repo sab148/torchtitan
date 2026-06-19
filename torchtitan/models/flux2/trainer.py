@@ -19,39 +19,22 @@ from torch.distributed.checkpoint.state_dict import (
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
+
+from .configs import Flux2EncoderConfig
+from .flux_datasets import Flux2DataLoader
+from .parallelize import parallelize_text_encoder
+from .tokenizer import Flux2TokenizerContainer
+from .utils import (
+    create_image_position_ids,
+    create_text_position_ids,
+    flatten_image_tokens,
+    load_flux2_autoencoder,
+    load_flux2_text_encoder,
+    load_flux2_transformer_state_dict,
+    preprocess_flux2_batch,
+    TextEmbeddingCache,
+)
 from torchtitan.trainer import Trainer
-
-try:
-    from .configs import Flux2EncoderConfig
-    from .flux_datasets import Flux2DataLoader
-    from .parallelize import parallelize_text_encoder
-    from .tokenizer import Flux2TokenizerContainer
-    from .utils import (
-        create_image_position_ids,
-        create_text_position_ids,
-        flatten_image_tokens,
-        load_flux2_autoencoder,
-        load_flux2_text_encoder,
-        load_flux2_transformer_state_dict,
-        preprocess_flux2_batch,
-        TextEmbeddingCache,
-    )
-except ImportError:
-    from torchtitan.models.flux2.configs import Flux2EncoderConfig
-    from torchtitan.models.flux2.flux_datasets import Flux2DataLoader
-    from torchtitan.models.flux2.parallelize import parallelize_text_encoder
-    from torchtitan.models.flux2.tokenizer import Flux2TokenizerContainer
-    from torchtitan.models.flux2.utils import (
-        create_image_position_ids,
-        create_text_position_ids,
-        flatten_image_tokens,
-        load_flux2_autoencoder,
-        load_flux2_text_encoder,
-        load_flux2_transformer_state_dict,
-        preprocess_flux2_batch,
-        TextEmbeddingCache,
-    )
-
 
 class Flux2Trainer(Trainer):
     @dataclass(kw_only=True, slots=True)
@@ -77,7 +60,7 @@ class Flux2Trainer(Trainer):
 
         latent_side = img_size // ae_downscale
         seq_len_img = latent_side * latent_side
-        seq_len_txt = config.tokenizer.max_text_encoding_len
+        seq_len_txt = config.encoder.max_text_encoding_len
         config.training.seq_len = seq_len_img + seq_len_txt
 
         super().__init__(config)
@@ -127,7 +110,7 @@ class Flux2Trainer(Trainer):
         self.text_encoder = load_flux2_text_encoder(
             model_config=model_config,
             encoder_config=config.encoder,
-            max_length=config.tokenizer.max_text_encoding_len,
+            max_length=config.encoder.max_text_encoding_len,
             device=self.device,
         )
         self.text_encoder = parallelize_text_encoder(
@@ -138,7 +121,7 @@ class Flux2Trainer(Trainer):
         self.text_embedding_cache = TextEmbeddingCache(
             encoder_config=config.encoder,
             text_encoder_kind=model_config.text_encoder_kind,
-            max_length=config.tokenizer.max_text_encoding_len,
+            max_length=config.encoder.max_text_encoding_len,
         )
 
     def batch_generator(
@@ -236,16 +219,15 @@ class Flux2Trainer(Trainer):
             )
 
         with self.train_context():
-            with self.maybe_enable_amp:
-                latent_noise_pred = model(
-                    x=noisy_latents,
-                    x_ids=latent_pos_ids,
-                    timesteps=timesteps,
-                    ctx=text_encodings,
-                    ctx_ids=text_pos_ids,
-                    guidance=guidance,
-                )
-                loss = self.loss_fn(latent_noise_pred, target) / global_valid_tokens
+            latent_noise_pred = model(
+                x=noisy_latents,
+                x_ids=latent_pos_ids,
+                timesteps=timesteps,
+                ctx=text_encodings,
+                ctx_ids=text_pos_ids,
+                guidance=guidance,
+            )
+            loss = self.loss_fn(latent_noise_pred, target) / global_valid_tokens
 
             del latent_noise_pred, noise, target
             loss.backward()
@@ -308,10 +290,13 @@ class Flux2Trainer(Trainer):
 
 
 def main() -> None:
+    print("Starting FLUX.2 trainer...?2")
     from torchtitan.train import main as train_main
-
+    print("Starting FLUX.2 trainer...?3")
     train_main()
+    print("Starting FLUX.2 trainer...?4")
 
 
 if __name__ == "__main__":
+    print("Starting FLUX.2 trainer...?")
     main()
